@@ -10,7 +10,7 @@ from disqco import (
 from disqco import PartitionedCircuitExtractor
 import networkx as nx
 from disqco.scheduling.evaluator import evaluate_quantum_runtime
-from disqco.scheduling.schedule_graph import plot_schedule
+from disqco.scheduling.utils import plot_schedule
 from disqco.scheduling.greedy_scheduler import greedy_scheduler
 
 demo_dir = Path(__file__).parent
@@ -92,14 +92,32 @@ partitioned_circuit.draw(
     output="mpl", style="bw", fold=50, filename=str(partitioned_circuit_path)
 )
 
-runtime, schedule = evaluate_quantum_runtime(partitioned_circuit, {'u': 1, 'cp': 2, 'cx': 2, "swap": 6, 'measure': 5, 'EPR': 100})
+# Durations in units of one single-qubit gate. Two literature-grounded
+# regimes (sweep EPR between them - the conclusion depends on it):
+#  - Trapped-ion + optical network (demonstrated DQC, Main et al.,
+#    arXiv:2407.00835): 1q ~10us, 2q ~5-10x 1q, measurement ~10x,
+#    heralded EPR ~5-10ms => EPR ~ 500-1000x a 1q gate.
+#  - Superconducting + microwave link (deterministic, e.g. Kurpiers et al.,
+#    npj QI 2019): EPR only ~2-20x a 2q gate => EPR ~ 20.
+EPR_DURATION = 500          # ion-optical headline; set ~20 for SC-microwave
+DURATIONS = {
+    'u': 1,                 # single-qubit gate (reference unit)
+    'cp': 5, 'cx': 5, 'cz': 5,   # two-qubit gate ~5x 1q (ion-trap ratio)
+    'swap': 15,             # 3 back-to-back cx
+    'measure': 10,          # readout ~10x 1q
+    'reset': 5,
+    'x': 1, 'z': 1,         # classical-feedforward corrections
+    'EPR': EPR_DURATION,
+}
+
+runtime, schedule = evaluate_quantum_runtime(partitioned_circuit, DURATIONS)
 print("Total quantum runtime of circuit: ", runtime)
 
 plot_schedule(partitioned_circuit, schedule, runtime, save_path=demo_dir / "circuit_schedule.png")
 
 print("---------------------------------------------")
 
-runtime, schedule = greedy_scheduler(partitioned_circuit, {'u': 1, 'cp': 2, 'cx': 2, "swap": 6, 'measure': 5, 'EPR': 100})
+runtime, schedule = greedy_scheduler(partitioned_circuit, DURATIONS)
 print("Total greedy quantum runtime of circuit: ", runtime)
 
 plot_schedule(partitioned_circuit, schedule, runtime, save_path=demo_dir / "circuit_schedule_greedy.png")

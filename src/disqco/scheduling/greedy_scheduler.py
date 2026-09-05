@@ -54,6 +54,13 @@ def greedy_scheduler(circuit: QuantumCircuit, durations: dict, priority="critica
     assert len(schedule) == len(circuit.data), "dispatcher stalled"
     return (total_quantum_runtime, schedule)
 
+def emit_schedule(circuit, schedule):
+    new = circuit.copy_empty_like()
+    for entry in sorted(schedule, key=lambda e: (e["start"], e["op_idx"])):
+        new.append(circuit.data[entry["op_idx"]])
+    return new
+
+
 def downstream_weights(graph, circuit, durations):
     weight = {}
     for n in reversed(list(nx.topological_sort(graph))):

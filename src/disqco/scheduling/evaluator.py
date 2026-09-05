@@ -20,12 +20,6 @@ def evaluate_quantum_runtime(circuit: QuantumCircuit, durations: dict, include_c
 
     return (total_quantum_runtime, schedule)
 
-def emit_schedule(circuit, schedule):
-    new = circuit.copy_empty_like()
-    for entry in sorted(schedule, key=lambda e: (e["start"], e["op_idx"])):
-        new.append(circuit.data[entry["op_idx"]])
-    return new
-
 def wires_of(inst, include_clbits=True):
     wires = list(inst.qubits)
     if include_clbits:

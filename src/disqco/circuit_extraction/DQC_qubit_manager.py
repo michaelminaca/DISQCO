@@ -2,6 +2,7 @@ from qiskit import QuantumRegister, ClassicalRegister, QuantumCircuit
 from qiskit.circuit import Qubit, Clbit
 import copy
 import networkx as nx
+from collections import deque
 
 def find_swap_path(topology, src_idx, dst_idx) -> list[tuple[int, int]]:
     """
@@ -10,6 +11,14 @@ def find_swap_path(topology, src_idx, dst_idx) -> list[tuple[int, int]]:
     path = nx.shortest_path(topology, source=src_idx, target=dst_idx)
     swap_path = [(path[i], path[i + 1]) for i in range(len(path) - 2)]
     return swap_path
+
+def build_epr_gate():
+    circuit = QuantumCircuit(2)
+    circuit.h(0)
+    circuit.cx(0, 1)
+    gate = circuit.to_gate()
+    gate.name = "EPR"
+    return gate
 
 # -------------------------------------------------------------------
 # CommunicationQubitManager
@@ -25,10 +34,15 @@ class CommunicationQubitManager:
         self.free_comm = {}  # Store free communication qubits for each partition
         self.in_use_comm = {}  # Store in-use communication qubits for each partition
         self.network = network
+        self.ready_pairs = {}
+        self.link_demand = None
 
         # self.linked_qubits = {}  # Store comm qubits linked to root qubits for gate teleportation
 
         self.initilize_communication_qubits()
+
+    def set_demand(self, demand):
+        self.link_demand = dict(demand)
 
     def initilize_communication_qubits(self) -> None:
         """
@@ -85,12 +99,56 @@ class CommunicationQubitManager:
         if comm_qubit in self.in_use_comm[p]:
             self.in_use_comm[p].remove(comm_qubit)
             self.free_comm[p].append(comm_qubit)
+            if self.link_demand is not None:
+                self.refill()
 
     def get_status(self, p: int) -> tuple[list, list]:
         """
         Return a tuple (in_use, free) for partition p.
         """
         return self.in_use_comm.get(p, []), self.free_comm.get(p, [])
+
+    def has_free_comm(self, p: int, neighbor: int) -> bool:
+            eligible = set(self.network.comm_qubits_for_link(p, neighbor))
+            return any(self.comm_index(p, q) in eligible for q in self.free_comm[p])
+
+    def refill(self) -> None:
+        if self.link_demand is None:
+            return
+        for key, remaining in list(self.link_demand.items()):
+            while len(self.ready_pairs.get(key, [])) < remaining:
+                if not self.cook_pair(*key):
+                    break
+
+    def cook_pair(self, p_a: int, p_b: int) -> bool:
+        if self.network is None:
+            return False
+        if not (self.has_free_comm(p_a, p_b) and self.has_free_comm(p_b, p_a)):
+            return False
+        qubit_a = self.find_comm_idx(p_a, neighbor=p_b)
+        qubit_b = self.find_comm_idx(p_b, neighbor=p_a)
+        self.qc.append(build_epr_gate(), [qubit_a, qubit_b])
+        key = tuple(sorted((p_a, p_b)))
+        sided = (qubit_a, qubit_b) if p_a < p_b else (qubit_b, qubit_a)
+        self.ready_pairs.setdefault(key, deque()).append(sided)
+        return True
+
+    def claim_pair(self, p_a: int, p_b:int) -> tuple[Qubit, Qubit]:
+        key = tuple(sorted((p_a, p_b)))
+        if self.link_demand is not None:
+            remaining = self.link_demand.get(key, 0)
+            assert remaining > 0, f"Link {key} has no remaining demand"
+            self.link_demand[key] = remaining - 1
+        queue = self.ready_pairs.get(key)
+        # If there exists a ready epr pair for parition a and b
+        if queue:
+            low, high = queue.popleft()
+            return (low, high) if p_a < p_b else (high, low)
+        # No EPR pair exists for these partitions, so we cook one
+        qubit_a = self.find_comm_idx(p_a, neighbor=p_b)
+        qubit_b = self.find_comm_idx(p_b, neighbor=p_a)
+        self.qc.append(build_epr_gate(), [qubit_a, qubit_b])
+        return qubit_a, qubit_b
 
 # -------------------------------------------------------------------
 # ClassicalBitManager
@@ -250,7 +308,6 @@ class DataQubitManager:
                 self.free_data[p].remove(slot_b)
                 self.free_data[p].append(slot_a)
         return reg[path[-1][1]]
-
 
     def initialise_data_qubits(self) -> None:
         """

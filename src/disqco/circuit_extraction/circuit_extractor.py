@@ -448,10 +448,7 @@ class TeleportationManager:
         # Generate EPR pairs for all edges
         edges_to_comms = {}
         for p0, p1 in tree.edges():
-            comm0 = self.comm_manager.find_comm_idx(p0, neighbor = p1)
-            comm1 = self.comm_manager.find_comm_idx(p1, neighbor = p0)
-            epr = self.build_epr_circuit()
-            self.qc.append(epr, [comm0, comm1])
+            comm0, comm1 = self.comm_manager.claim_pair(p0, p1)
             edges_to_comms[(p0, p1)] = (comm0, comm1)
 
         from collections import deque
