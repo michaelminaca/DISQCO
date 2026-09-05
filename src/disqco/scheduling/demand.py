@@ -3,8 +3,6 @@ import numpy as np
 from disqco.graphs.QC_hypergraph import QuantumCircuitHyperGraph
 
 def link_demand_windows(hypergraph, assignment):
-    """Return a list of link records:
-    {kind, root, p_root, partition, first, last}."""
     links = []
 
     for t, layer in hypergraph.layers.items():
@@ -69,7 +67,6 @@ def link_demand_windows(hypergraph, assignment):
 
 
 def peak_concurrent_links(links):
-    """Highest number of simultaneously-open links (sweep line)."""
     events = sorted([(l['first'], 1) for l in links]
                     + [(l['last'] + 1, -1) for l in links])
     running = peak = 0
@@ -80,7 +77,6 @@ def peak_concurrent_links(links):
 
 
 def demand_profile(links, depth):
-    """Concurrent open links at every layer t -> list of length depth."""
     profile = [0] * depth
     for l in links:
         for t in range(l['first'], min(l['last'] + 1, depth)):
