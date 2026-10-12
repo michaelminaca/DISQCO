@@ -15,6 +15,10 @@ def dephasing_fidelity(t, T2):
     """fidelity of a superposition that waited t on a qubit with coherence time T2"""
     return (1 + math.exp(-t / T2)) / 2
 
+def swap_error_cost(error_model):
+    """-log of the fidelity three two-qubit gates leave: a SWAP is three CX."""
+    return -3 * math.log(1 - error_model.p2)
+
 def two_qubit_gates(circuit):
     return sum(1 for inst in circuit.data if len(inst.qubits) == 2 and inst.operation.name != "EPR")
 

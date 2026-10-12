@@ -2,14 +2,13 @@ import heapq
 import math
 import random
 from enum import IntEnum
-from disqco.scheduling.buffer import BufferEvent, maybe_move_tail, spare_slots_by_qpu
-from disqco.scheduling.decay import use_by_time_of_pair
 from disqco.scheduling.errors import ErrorModel, fidelity
 from disqco.scheduling.evaluator import duration_of, wires_of
-from disqco.scheduling.scheduler import (ScheduleState, claim_order_by_priority, claims_to_start, host_chooser,
-                                         instruction_finished, prepare, start_instruction)
+from disqco.scheduling.scheduler import (ScheduleState, claim_order_by_priority, claims_to_start, host_chooser, prepare, start_instruction)
 from disqco.scheduling.sessions import first_instruction_using_the_pair, sessions_ending_at, sessions_opening_at
-
+from disqco.scheduling.buffer import BufferEvent, move_tail_if_it_pays, spare_slots_by_qpu
+from disqco.scheduling.decay import use_by_time_of_pair
+from disqco.scheduling.helper import ancestor_eprs
 
 class EPREvent(IntEnum):
     TIMED_OUT = -3
@@ -19,6 +18,7 @@ class StochasticScheduleState(ScheduleState):
         super().__init__(num_instructions, preds)
         self.attempt = mean * p
         self.p = p
+        self.mean = mean
         self.cutoff = cutoff
         self.trial = trial
         self.error_model = error_model
@@ -100,9 +100,21 @@ def epr_timed_out(state, epr, circuit, sessions, session_of, succs, sessions_ope
     state.ready.add(epr)
     state.discards += 1
 
+def instruction_finished(state, idx, succs, sessions_closing_from_instruction, sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time, consumer_of_session, eprs_before_consumer, preds):
+    for successor in succs[idx]:
+        state.indeg[successor] -= 1
+        if state.indeg[successor] == 0:
+            state.ready.add(successor)
 
-def finish_instructions_at_clock(state, circuit, sessions, session_of, succs, sessions_closing_from_instruction,
-                                 sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time):
+    for session_id in sessions_closing_from_instruction.get(idx, []):
+        del state.held[state.host[session_id]]
+
+    for session_id in sessions_opening_from_instruction.get(idx, []):
+        move_tail_if_it_pays(state, session_id, meta, spare, epr_of, swap_time, reset_time,
+                             consumer_of_session, eprs_before_consumer, preds)
+
+
+def finish_instructions_at_clock(state, circuit, sessions, session_of, succs, sessions_closing_from_instruction, sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time, consumer_of_session, eprs_before_consumer, preds):
     while state.running and state.next_finish() == state.clock:
         time, idx_or_kind, *rest = heapq.heappop(state.running)
         if isinstance(idx_or_kind, BufferEvent):
@@ -121,7 +133,7 @@ def finish_instructions_at_clock(state, circuit, sessions, session_of, succs, se
             continue
         state.finished.add(idx_or_kind)
         instruction_finished(state, idx_or_kind, succs, sessions_closing_from_instruction, sessions_opening_from_instruction,
-                             meta, spare, epr_of, swap_time, reset_time)
+                             meta, spare, epr_of, swap_time, reset_time, consumer_of_session, eprs_before_consumer, preds)
         if idx_or_kind in sessions_opening_from_instruction:
             epr_generated(state, idx_or_kind, sessions_opening_from_instruction)
 
@@ -132,6 +144,9 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
     sessions_opening_from_instruction = sessions_opening_at(sessions)
     sessions_closing_from_instruction = sessions_ending_at(sessions)
     epr_of = [instructions[0] for instructions in sessions]
+    consumer_of_session = {session_id: first_instruction_using_the_pair(circuit, sessions, session_of, session_id) for session_id in range(len(sessions))}
+    ancestors = ancestor_eprs(circuit, preds, sessions_opening_from_instruction)
+    eprs_before_consumer = {consumer: ancestors[consumer] - {epr_of[session_id]} for session_id, consumer in consumer_of_session.items()}
     spare = spare or {}
     swap_time, reset_time = duration_of("swap", durations), duration_of("reset", durations)
     error_model = error_model or ErrorModel()
@@ -153,12 +168,12 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
         if state.running:
             state.clock = state.next_finish()
             finish_instructions_at_clock(state, circuit, sessions, session_of, succs, sessions_closing_from_instruction,
-                                         sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time)
+                                         sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time,
+                                         consumer_of_session, eprs_before_consumer, preds)
         elif state.ready:
             raise RuntimeError("stalled")
 
     return state
-
 
 def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=None, commuting=True, buffer=False, error_model=None):
     """returns (makespan, discards, state)"""

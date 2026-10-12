@@ -1,3 +1,8 @@
+import math
+
+from disqco.scheduling.errors import swap_error_cost
+
+
 def use_by_time_of_half(state, session_id, epr):
     """Time when the epr half decoheres given the cutoff"""
     herald = state.epr_generated_at[epr]

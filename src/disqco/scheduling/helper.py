@@ -62,3 +62,14 @@ def comm_qubits_of_qpu(circuit: QuantumCircuit):
 
     return qpu_to_comm_qubits
 
+def ancestor_eprs(circuit, preds, sessions_opening_from_instruction):
+    """{instruction index: the EPR instructions among its ancestors}. circuit.data is in topological order."""
+    ancestors = [frozenset()] * len(circuit.data)
+    for idx in range(len(circuit.data)):
+        found = set()
+        for pred in preds[idx]:
+            found |= ancestors[pred]
+            if pred in sessions_opening_from_instruction:
+                found.add(pred)
+        ancestors[idx] = frozenset(found)
+    return ancestors
