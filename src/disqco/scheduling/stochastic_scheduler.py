@@ -4,11 +4,11 @@ import random
 from enum import IntEnum
 from disqco.scheduling.errors import ErrorModel, fidelity
 from disqco.scheduling.evaluator import duration_of, wires_of
-from disqco.scheduling.scheduler import (ScheduleState, claim_order_by_priority, claims_to_start, host_chooser, prepare, start_instruction)
+from disqco.scheduling.scheduler import (ScheduleState, claim_order_by_priority, claims_to_start, first_instruction_may_start, host_chooser, prepare, start_instruction)
 from disqco.scheduling.sessions import first_instruction_using_the_pair, sessions_ending_at, sessions_opening_at
 from disqco.scheduling.buffer import BufferEvent, expected_wait_until_pair_is_used, move_tail_if_it_pays, spare_slots_by_qpu
 from disqco.scheduling.decay import use_by_time_of_pair
-from disqco.scheduling.helper import ancestor_eprs
+from disqco.scheduling.helper import ancestor_eprs, instructions_to_start_before_first_instruction_on_data
 
 class EPREvent(IntEnum):
     TIMED_OUT = -3
@@ -158,7 +158,7 @@ def finish_instructions_at_clock(state, circuit, sessions, session_of, succs, se
 
 
 def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, pool, choose_host, spare=None,
-        mean=100, p=1.0, cutoff=None, trial=0, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0):
+        mean=100, p=1.0, cutoff=None, trial=0, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True):
     circuit_wires = [wires_of(instruction) for instruction in circuit.data]
     sessions_opening_from_instruction = sessions_opening_at(sessions)
     sessions_closing_from_instruction = sessions_ending_at(sessions)
@@ -169,6 +169,7 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
     spare = spare or {}
     swap_time, reset_time = duration_of("swap", durations), duration_of("reset", durations)
     error_model = error_model or ErrorModel()
+    instructions_to_start_before_first_instruction = instructions_to_start_before_first_instruction_on_data(circuit, session_of, preds) if lazy_first_instructions else {}
     state = StochasticScheduleState(len(circuit.data), preds, mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff)
 
     while state.ready or state.running:
@@ -176,6 +177,8 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
         while started_anything:
             started_anything = False
             for idx in sorted(state.ready, key=lambda i: -priority[i]):
+                if not first_instruction_may_start(state, idx, instructions_to_start_before_first_instruction):
+                    continue
                 claims = claims_to_start(state, idx, circuit_wires, session_of, meta, pool, choose_host)
                 if claims is None:
                     continue
@@ -194,23 +197,23 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
 
     return state
 
-def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0):
+def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True):
     """returns (makespan, discards, state)"""
     renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, True, commuting)
     choose_host = host_chooser(claim_order_by_priority(sessions, meta, priority), meta)
     spare = spare_slots_by_qpu(renamed_circuit, network) if buffer else None
     state = run(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host, spare,
-                mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff)
+                mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff, lazy_first_instructions)
     return max(state.end), state.discards, state
 
-def simulate_many(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0):
+def simulate_many(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True):
     renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, True, commuting)
     choose_host = host_chooser(claim_order_by_priority(sessions, meta, priority), meta)
     spare = spare_slots_by_qpu(renamed_circuit, network) if buffer else None
     makespans, discards, log_fidelities = [], [], []
     for trial in range(trials):
         state = run(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host, spare,
-                    mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff)
+                    mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff, lazy_first_instructions)
         makespans.append(max(state.end))
         discards.append(state.discards)
         if error_model is not None:

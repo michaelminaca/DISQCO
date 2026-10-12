@@ -73,3 +73,21 @@ def ancestor_eprs(circuit, preds, sessions_opening_from_instruction):
                 found.add(pred)
         ancestors[idx] = frozenset(found)
     return ancestors
+
+def instructions_to_start_before_first_instruction_on_data(circuit, session_of, preds):
+    """{first instruction on a data qubit: predecessors on other wires of the first instruction on that qubit that uses a session}
+    A data qubit waits for these before its first instruction, so it does not start dephasing before its pair is on the way."""
+    instructions_on_data_qubit = {}
+    for idx, instruction in enumerate(circuit.data):
+        for qubit in instruction.qubits:
+            if session_of.get((idx, qubit)) is None:
+                instructions_on_data_qubit.setdefault(qubit, []).append(idx)
+
+    instructions_to_start_before = {}
+    for qubit, instructions in instructions_on_data_qubit.items():
+        first_instruction_using_a_session = next((idx for idx in instructions
+                                                  if any((idx, wire) in session_of for wire in circuit.data[idx].qubits)), None)
+        if first_instruction_using_a_session is None or first_instruction_using_a_session == instructions[0]:
+            continue
+        instructions_to_start_before[instructions[0]] = [pred for pred in preds[first_instruction_using_a_session] if pred not in instructions]
+    return instructions_to_start_before

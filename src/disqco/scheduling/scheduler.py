@@ -4,7 +4,7 @@ from disqco.scheduling.errors import best_by_fidelity
 from disqco.scheduling.evaluator import duration_of, evaluate_quantum_runtime, wires_of
 from disqco.scheduling.schedule_to_circuit import best_of, schedule_to_circuit
 from disqco.scheduling.sessions import sessions_ending_at, find_sessions, sessions_opening_at
-from disqco.scheduling.helper import comm_qubits_of_qpu, predecessors_and_successors, priority_of_operation
+from disqco.scheduling.helper import comm_qubits_of_qpu, predecessors_and_successors, priority_of_operation, instructions_to_start_before_first_instruction_on_data
 from disqco.scheduling.hardware import hosts_by_session
 from disqco.scheduling.buffer import BufferEvent, spare_slots_by_qpu, maybe_move_tail
 
@@ -162,6 +162,12 @@ def claims_to_start(state: ScheduleState, index, circuit_wires, session_of, meta
 
     return claims
 
+def first_instruction_may_start(state, idx, instructions_to_start_before):
+    """False while idx is the first instruction on a data qubit whose pair is not on the way yet"""
+    if idx not in instructions_to_start_before:
+        return True
+    return all(state.start[other] is not None for other in instructions_to_start_before[idx])
+
 def start_instruction(state, idx, claims, circuit, circuit_wires, session_of, durations):
     duration = duration_of(circuit.data[idx].operation.name, durations)
     finish = state.clock + duration
@@ -204,8 +210,9 @@ def finish_instructions_at_clock(state, succs, sessions_closing_from_instruction
         instruction_finished(state, idx, succs, sessions_closing_from_instruction, sessions_opening_from_instruction,
                              meta, spare, epr_of, swap_time, reset_time)
 
-def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, pool, choose_host, spare=None):
+def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, pool, choose_host, spare=None, lazy_first_instructions=True):
     circuit_wires = [wires_of(instruction) for instruction in circuit.data]
+    instructions_to_start_before_first_instruction = instructions_to_start_before_first_instruction_on_data(circuit, session_of, preds) if lazy_first_instructions else {}
     sessions_opening_from_instruction = sessions_opening_at(sessions)
     sessions_closing_from_instruction = sessions_ending_at(sessions)
     epr_of = [instructions[0] for instructions in sessions]
@@ -218,6 +225,8 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
         while started_anything:
             started_anything = False
             for idx in sorted(state.ready, key=lambda i: -priority[i]):
+                if not first_instruction_may_start(state, idx, instructions_to_start_before_first_instruction):
+                    continue
                 claims = claims_to_start(state, idx, circuit_wires, session_of, meta, pool, choose_host)
                 if claims is None:
                     continue
@@ -233,9 +242,9 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
 
     return state
 
-def run_without_stalling(*arguments):
+def run_without_stalling(*arguments, **keywords):
     try:
-        return run(*arguments)
+        return run(*arguments, **keywords)
     except RuntimeError:
         return None
 
@@ -247,18 +256,18 @@ def prepare(circuit, durations, network=None, include_clbits=True, commuting=Fal
     priority = priority_of_operation(renamed_circuit, succs, durations)
     return renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority
 
-def schedule(circuit, durations, network=None, include_clbits=True, commuting=False, buffer=False, model=None, per_unit_time=False):
+def schedule(circuit, durations, network=None, include_clbits=True, commuting=False, buffer=False, model=None, per_unit_time=False, lazy_first_instructions=True):
     renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, include_clbits, commuting)
 
     candidates = []
     for order in (claim_order_by_circuit(sessions, meta), claim_order_by_priority(sessions, meta, priority)):
         choose_host = host_chooser(order, meta)
-        state = run_without_stalling(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host)
+        state = run_without_stalling(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host, lazy_first_instructions=lazy_first_instructions)
         if state is not None:
             candidates.append((state, schedule_to_circuit(renamed_circuit, state, sessions_of, sessions)))
         if buffer:
             state = run_without_stalling(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host,
-                                         spare_slots_by_qpu(renamed_circuit, network))
+                                         spare_slots_by_qpu(renamed_circuit, network), lazy_first_instructions)
             if state is not None:
                 candidates.append((state, schedule_to_circuit(renamed_circuit, state, sessions_of, sessions)))
 

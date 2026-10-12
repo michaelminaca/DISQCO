@@ -1,37 +1,3 @@
-"""Partition a circuit across three QPUs, then schedule it with the deterministic scheduler.
-
-Every EPR pair takes exactly DURATIONS["EPR"] time units, so one run gives one schedule.
-The demo prints the makespan (the time the last instruction finishes) after each stage,
-with the percentage it took off the stage before, and the estimated fidelity F of each
-scheduled stage under ERROR_MODEL:
-
-    as extracted               the circuit the extractor produced
-    classical bits renamed     each classical bit written only once
-    scheduled                  a session may use any communication qubit of its QPU;
-                               the session with the longest path to the end claims first
-    scheduled + commuting      the same, with commuting gates free to reorder
-    buffer                     on QPUs with spare data qubits, a waiting half-pair is
-                               parked on a spare qubit whenever another session wants
-                               its communication qubit
-    buffer, swap if it pays    the same, but a half-pair is parked only when the wait it
-                               faces would cost more fidelity than the swap; the online
-                               loop run with p = 1, so its timing is deterministic too.
-                               MAX_TIMEOUTS_PAIR_KEPT_BEYOND_CUTOFF is passed through for
-                               completeness: with p = 1 and no cutoff no pair ever times
-                               out, so it changes nothing here
-
-Then the error budget of three of those schedules, and what schedule() keeps when asked
-for the shortest schedule and when asked for the highest-fidelity one.
-
-Saved next to this file:
-
-    circuit.png                the logical circuit we started from
-    partition_result.png       the hypergraph, coloured by which QPU each qubit went to
-    <stage>_circuit.png        the circuit after each stage
-    <stage>_schedule.png       when each instruction runs, one lane per qubit
-    circuits.qpy               every stage's circuit, to load back with qpy.load
-"""
-
 import math
 from pathlib import Path
 
@@ -107,7 +73,7 @@ def finish_pass(state, renamed, sessions, session_of):
     return scheduled_circuit, runtime, entries, math.exp(total), logs
 
 
-def scheduled_pass(partitioned_circuit, network, commuting, buffer=False):
+def scheduled_pass(partitioned_circuit, network, commuting, buffer=False, lazy_first_instructions=False):
     """One deterministic scheduling pass, longest path first, on the strict or the commuting graph.
 
     Returns (circuit, runtime, schedule entries, fidelity, log terms by error source),
@@ -119,15 +85,18 @@ def scheduled_pass(partitioned_circuit, network, commuting, buffer=False):
     order = claim_order_by_priority(sessions, meta, priority)
     spare = spare_slots_by_qpu(renamed, network) if buffer else None
     state = run_without_stalling(renamed, sessions, session_of, meta, preds, succs,
-                                 priority, DURATIONS, pool, host_chooser(order, meta), spare)
+                                 priority, DURATIONS, pool, host_chooser(order, meta), spare,
+                                 lazy_first_instructions=lazy_first_instructions)
     if state is None:
         return None, None, None, None, None
     return finish_pass(state, renamed, sessions, session_of)
 
 
-def gated_buffer_pass(partitioned_circuit, network):
+def gated_buffer_pass(partitioned_circuit, network, lazy_first_instructions=False):
     """The online loop with p = 1 and no cutoff: deterministic timing, but the buffer swaps a
-    half-pair onto a slot only when the wait it faces would cost more fidelity than the swap."""
+    half-pair onto a slot only when the wait it faces would cost more fidelity than the swap.
+    With lazy_first_instructions, a data qubit's first instruction waits until the gate before
+    its first session gate on the communication qubit has started."""
     renamed, sessions, session_of, meta, preds, succs, pool, priority = prepare(
         partitioned_circuit, DURATIONS, network, commuting=True)
 
@@ -136,7 +105,8 @@ def gated_buffer_pass(partitioned_circuit, network):
     state = run_online(renamed, sessions, session_of, meta, preds, succs, priority, DURATIONS, pool,
                        host_chooser(order, meta), spare, mean=DURATIONS["EPR"], p=1.0, cutoff=None,
                        error_model=ERROR_MODEL,
-                       max_timeouts_pair_kept_beyond_cutoff=MAX_TIMEOUTS_PAIR_KEPT_BEYOND_CUTOFF)
+                       max_timeouts_pair_kept_beyond_cutoff=MAX_TIMEOUTS_PAIR_KEPT_BEYOND_CUTOFF,
+                       lazy_first_instructions=lazy_first_instructions)
     return finish_pass(state, renamed, sessions, session_of)
 
 
@@ -149,6 +119,11 @@ def print_stage(label, runtime, against, fidelity=None):
     if fidelity is not None:
         line += "   F {:.3f}".format(fidelity)
     print(line)
+
+
+def print_moves(circuit):
+    print("    half-pairs moved onto slots:", circuit.count_ops().get("swap", 0),
+          "of", circuit.count_ops().get("EPR", 0) * 2, "sessions")
 
 
 def print_error_budget(label, logs):
@@ -202,11 +177,19 @@ gated_circuit, gated_runtime, gated_schedule, gated_fidelity, gated_logs = gated
     roomy_circuit, roomy_network)
 save(gated_circuit, "buffered_if_it_pays", gated_runtime, gated_schedule)
 
-by_makespan_runtime, _, _ = schedule(roomy_circuit, DURATIONS, network=roomy_network, commuting=True, buffer=True)
-by_fidelity_runtime, _, _ = schedule(roomy_circuit, DURATIONS, network=roomy_network, commuting=True, buffer=True,
-                                     model=ERROR_MODEL)
+lazy_circuit, lazy_runtime, lazy_schedule, lazy_fidelity, lazy_logs = gated_buffer_pass(
+    roomy_circuit, roomy_network, lazy_first_instructions=True)
+save(lazy_circuit, "lazy_first_instructions", lazy_runtime, lazy_schedule)
 
-stages = [before_circuit, renamed_circuit, scheduled_circuit, commuting_circuit, buffered_circuit, gated_circuit]
+by_makespan_runtime, _, _ = schedule(roomy_circuit, DURATIONS, network=roomy_network, commuting=True, buffer=True,
+                                     lazy_first_instructions=False)
+by_fidelity_runtime, _, _ = schedule(roomy_circuit, DURATIONS, network=roomy_network, commuting=True, buffer=True,
+                                     model=ERROR_MODEL, lazy_first_instructions=False)
+by_fidelity_lazy_runtime, _, _ = schedule(roomy_circuit, DURATIONS, network=roomy_network, commuting=True, buffer=True,
+                                          model=ERROR_MODEL, lazy_first_instructions=True)
+
+stages = [before_circuit, renamed_circuit, scheduled_circuit, commuting_circuit, buffered_circuit, gated_circuit,
+          lazy_circuit]
 with open(demo_dir / "circuits.qpy", "wb") as handle:
     qpy.dump([stage for stage in stages if stage is not None], handle)
 
@@ -226,20 +209,22 @@ else:
 print("--- with {} spare data qubits per QPU".format(SPARE))
 print("{:32}{:5}           F {:.3f}".format("no buffer:", roomy_runtime, roomy_fidelity))
 print_stage("buffer:", buffered_runtime, roomy_runtime, buffered_fidelity)
-print("    half-pairs moved onto slots:", buffered_circuit.count_ops().get("swap", 0),
-      "of", buffered_circuit.count_ops().get("EPR", 0) * 2, "sessions")
+print_moves(buffered_circuit)
 print_stage("buffer, swap only if it pays:", gated_runtime, roomy_runtime, gated_fidelity)
-print("    half-pairs moved onto slots:", gated_circuit.count_ops().get("swap", 0),
-      "of", gated_circuit.count_ops().get("EPR", 0) * 2, "sessions")
+print_moves(gated_circuit)
+print_stage("+ lazy first instructions:", lazy_runtime, roomy_runtime, lazy_fidelity)
+print_moves(lazy_circuit)
 
 print("---------------------------------------------")
 print_error_budget("scheduled + commuting", commuting_logs)
 print_error_budget("buffer", buffered_logs)
 print_error_budget("buffer, swap only if it pays", gated_logs)
+print_error_budget("buffer, swap only if it pays + lazy first instructions", lazy_logs)
 
 print("---------------------------------------------")
-print("schedule() keeps the shortest:         makespan", by_makespan_runtime)
-print("schedule() keeps the highest fidelity: makespan", by_fidelity_runtime)
+print("schedule() keeps the shortest:                                  makespan", by_makespan_runtime)
+print("schedule() keeps the highest fidelity:                          makespan", by_fidelity_runtime)
+print("schedule() keeps the highest fidelity, lazy first instructions: makespan", by_fidelity_lazy_runtime)
 
 moves = buffered_circuit.count_ops().get("swap", 0)
 assert buffered_circuit.count_ops().get("reset", 0) == roomy_circuit.count_ops().get("reset", 0) + moves
