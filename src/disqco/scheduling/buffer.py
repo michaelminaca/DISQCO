@@ -84,9 +84,13 @@ def expected_wait_for_consumer(state, consumer, eprs_before_consumer, preds):
                      if state.start[pred] is not None and state.end[pred] > state.clock]
     return max(still_running, default=0)
 
+def expected_wait_until_pair_is_used(state, epr, sessions_opening_from_instruction, consumer_of_session, eprs_before_consumer, preds):
+    """estimated time for how long until the pair is used, the nearer of its two halves' consumers."""
+    return min(expected_wait_for_consumer(state, consumer_of_session[session_id], eprs_before_consumer, preds)
+               for session_id in sessions_opening_from_instruction[epr])
 
 def holding_costs_more_than_a_swap(state, session_id, consumer_of_session, eprs_before_consumer, preds):
-    """true if the expected wait for the consumer costs more t2 fidelity, false if a swap to buffer slot would be better"""
+    """true if the expected wait for the consumer costs more than the fidelity of a swap to a buffer slot, false if a swap to buffer slot would be better"""
     extra_decay_per_unit_on_comm = (1 / state.error_model.T2_comm - 1 / state.error_model.T2_data) / 2
     expected_wait = expected_wait_for_consumer(state, consumer_of_session[session_id], eprs_before_consumer, preds)
     return expected_wait * extra_decay_per_unit_on_comm > swap_error_cost(state.error_model)

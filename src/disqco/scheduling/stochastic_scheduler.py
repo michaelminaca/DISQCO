@@ -6,7 +6,7 @@ from disqco.scheduling.errors import ErrorModel, fidelity
 from disqco.scheduling.evaluator import duration_of, wires_of
 from disqco.scheduling.scheduler import (ScheduleState, claim_order_by_priority, claims_to_start, host_chooser, prepare, start_instruction)
 from disqco.scheduling.sessions import first_instruction_using_the_pair, sessions_ending_at, sessions_opening_at
-from disqco.scheduling.buffer import BufferEvent, move_tail_if_it_pays, spare_slots_by_qpu
+from disqco.scheduling.buffer import BufferEvent, expected_wait_until_pair_is_used, move_tail_if_it_pays, spare_slots_by_qpu
 from disqco.scheduling.decay import use_by_time_of_pair
 from disqco.scheduling.helper import ancestor_eprs
 
@@ -14,7 +14,7 @@ class EPREvent(IntEnum):
     TIMED_OUT = -3
 
 class StochasticScheduleState(ScheduleState):
-    def __init__(self, num_instructions, preds, mean, p, cutoff, trial, error_model):
+    def __init__(self, num_instructions, preds, mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff):
         super().__init__(num_instructions, preds)
         self.attempt = mean * p
         self.p = p
@@ -26,8 +26,9 @@ class StochasticScheduleState(ScheduleState):
         self.random_of_epr = {}
         self.epr_generated_at = {}
         self.discards = 0
+        self.timeouts_kept_through_of_epr = {}
         self.finished = set()
-
+        self.max_timeouts_pair_kept_beyond_cutoff = max_timeouts_pair_kept_beyond_cutoff
 
 
 def random_duration_of_epr(state, epr):
@@ -59,6 +60,7 @@ def epr_used(state, epr, circuit, sessions, session_of, sessions_opening_from_in
 def epr_generated(state, epr, sessions_opening_from_instruction):
     """called when an epr is successfully generated. Bookkeeping as well as adds the timeout event to the heap."""
     state.epr_generated_at[epr] = state.clock
+    state.timeouts_kept_through_of_epr[epr] = 0
     if state.cutoff is not None:
         use_by_time = use_by_time_of_pair(state, epr, sessions_opening_from_instruction)
         heapq.heappush(state.running, (use_by_time, EPREvent.TIMED_OUT, epr))
@@ -100,6 +102,17 @@ def epr_timed_out(state, epr, circuit, sessions, session_of, succs, sessions_ope
     state.ready.add(epr)
     state.discards += 1
 
+def time_to_check_the_pair_again(state, epr, sessions_opening_from_instruction, consumer_of_session, eprs_before_consumer, preds):
+    """at a timeout if expected time to use the pair is less than the mean of generating a new pair then push a new timeout event to the heap to recheck it later. Otherwise return None."""
+    if state.timeouts_kept_through_of_epr[epr] >= state.max_timeouts_pair_kept_beyond_cutoff:
+        return None
+    expected_wait_until_used = expected_wait_until_pair_is_used(state, epr, sessions_opening_from_instruction, consumer_of_session, eprs_before_consumer, preds)
+    if expected_wait_until_used >= state.mean:
+        return None
+    state.timeouts_kept_through_of_epr[epr] += 1
+    return state.clock + max(expected_wait_until_used, state.attempt)
+
+
 def instruction_finished(state, idx, succs, sessions_closing_from_instruction, sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time, consumer_of_session, eprs_before_consumer, preds):
     for successor in succs[idx]:
         state.indeg[successor] -= 1
@@ -119,16 +132,22 @@ def finish_instructions_at_clock(state, circuit, sessions, session_of, succs, se
         time, idx_or_kind, *rest = heapq.heappop(state.running)
         if isinstance(idx_or_kind, BufferEvent):
             continue
+
         if idx_or_kind == EPREvent.TIMED_OUT:
             epr = rest[0]
             if epr_used(state, epr, circuit, sessions, session_of, sessions_opening_from_instruction):
                 continue
             use_by_time = use_by_time_of_pair(state, epr, sessions_opening_from_instruction)
-            if use_by_time > state.clock:
+            if use_by_time > state.clock:   # happens when a epr is swapped onto a data qubit with higher T2
                 heapq.heappush(state.running, (use_by_time, EPREvent.TIMED_OUT, epr))
+                continue
+            check_again_at = time_to_check_the_pair_again(state, epr, sessions_opening_from_instruction, consumer_of_session, eprs_before_consumer, preds)
+            if check_again_at is not None:
+                heapq.heappush(state.running, (check_again_at, EPREvent.TIMED_OUT, epr))
                 continue
             epr_timed_out(state, epr, circuit, sessions, session_of, succs, sessions_opening_from_instruction, reset_time)
             continue
+
         if state.end[idx_or_kind] != time or idx_or_kind in state.finished:
             continue
         state.finished.add(idx_or_kind)
@@ -139,7 +158,7 @@ def finish_instructions_at_clock(state, circuit, sessions, session_of, succs, se
 
 
 def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, pool, choose_host, spare=None,
-        mean=100, p=1.0, cutoff=None, trial=0, error_model=None):
+        mean=100, p=1.0, cutoff=None, trial=0, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0):
     circuit_wires = [wires_of(instruction) for instruction in circuit.data]
     sessions_opening_from_instruction = sessions_opening_at(sessions)
     sessions_closing_from_instruction = sessions_ending_at(sessions)
@@ -150,8 +169,8 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
     spare = spare or {}
     swap_time, reset_time = duration_of("swap", durations), duration_of("reset", durations)
     error_model = error_model or ErrorModel()
-    state = StochasticScheduleState(len(circuit.data), preds, mean, p, cutoff, trial, error_model)
-    
+    state = StochasticScheduleState(len(circuit.data), preds, mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff)
+
     while state.ready or state.running:
         started_anything = True
         while started_anything:
@@ -175,23 +194,23 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
 
     return state
 
-def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=None, commuting=True, buffer=False, error_model=None):
+def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0):
     """returns (makespan, discards, state)"""
     renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, True, commuting)
     choose_host = host_chooser(claim_order_by_priority(sessions, meta, priority), meta)
     spare = spare_slots_by_qpu(renamed_circuit, network) if buffer else None
     state = run(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host, spare,
-                mean, p, cutoff, trial, error_model)
+                mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff)
     return max(state.end), state.discards, state
 
-def simulate_many(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None):
+def simulate_many(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0):
     renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, True, commuting)
     choose_host = host_chooser(claim_order_by_priority(sessions, meta, priority), meta)
     spare = spare_slots_by_qpu(renamed_circuit, network) if buffer else None
     makespans, discards, log_fidelities = [], [], []
     for trial in range(trials):
         state = run(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host, spare,
-                    mean, p, cutoff, trial, error_model)
+                    mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff)
         makespans.append(max(state.end))
         discards.append(state.discards)
         if error_model is not None:

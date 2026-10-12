@@ -15,7 +15,10 @@ scheduled stage under ERROR_MODEL:
                                its communication qubit
     buffer, swap if it pays    the same, but a half-pair is parked only when the wait it
                                faces would cost more fidelity than the swap; the online
-                               loop run with p = 1, so its timing is deterministic too
+                               loop run with p = 1, so its timing is deterministic too.
+                               MAX_TIMEOUTS_PAIR_KEPT_BEYOND_CUTOFF is passed through for
+                               completeness: with p = 1 and no cutoff no pair ever times
+                               out, so it changes nothing here
 
 Then the error budget of three of those schedules, and what schedule() keeps when asked
 for the shortest schedule and when asked for the highest-fidelity one.
@@ -61,6 +64,7 @@ demo_dir = Path(__file__).parent
 
 DURATIONS = {"u": 1, "cp": 2, "cx": 2, "swap": 6, "measure": 5, "EPR": 100}
 ERROR_MODEL = ErrorModel(T2_data=20000, T2_comm=2000, F_epr=0.98, F_meas=0.99, p2=0.003)
+MAX_TIMEOUTS_PAIR_KEPT_BEYOND_CUTOFF = 3
 
 NUM_QPUS = 3
 QPU_SIZE = 4
@@ -131,7 +135,8 @@ def gated_buffer_pass(partitioned_circuit, network):
     spare = spare_slots_by_qpu(renamed, network)
     state = run_online(renamed, sessions, session_of, meta, preds, succs, priority, DURATIONS, pool,
                        host_chooser(order, meta), spare, mean=DURATIONS["EPR"], p=1.0, cutoff=None,
-                       error_model=ERROR_MODEL)
+                       error_model=ERROR_MODEL,
+                       max_timeouts_pair_kept_beyond_cutoff=MAX_TIMEOUTS_PAIR_KEPT_BEYOND_CUTOFF)
     return finish_pass(state, renamed, sessions, session_of)
 
 
