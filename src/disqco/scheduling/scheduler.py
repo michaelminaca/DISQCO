@@ -1,6 +1,7 @@
 import heapq
 from qiskit import ClassicalRegister, QuantumCircuit
-from disqco.scheduling.evaluator import duration_of, wires_of
+from disqco.scheduling.errors import best_by_fidelity
+from disqco.scheduling.evaluator import duration_of, evaluate_quantum_runtime, wires_of
 from disqco.scheduling.schedule_to_circuit import best_of, schedule_to_circuit
 from disqco.scheduling.sessions import sessions_ending_at, find_sessions, sessions_opening_at
 from disqco.scheduling.helper import comm_qubits_of_qpu, predecessors_and_successors, priority_of_operation
@@ -54,6 +55,7 @@ class ScheduleState:
         self.ready = {idx for idx, count in enumerate(self.indeg) if count == 0}
         self.running = []
         self.moved = {}
+        self.moved_at = {}
 
     def is_free(self, wire):
         return self.free_at.get(wire, 0) <= self.clock
@@ -245,7 +247,7 @@ def prepare(circuit, durations, network=None, include_clbits=True, commuting=Fal
     priority = priority_of_operation(renamed_circuit, succs, durations)
     return renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority
 
-def schedule(circuit: QuantumCircuit, durations, network=None, include_clbits=True, commuting=False, buffer=False):
+def schedule(circuit, durations, network=None, include_clbits=True, commuting=False, buffer=False, model=None, per_unit_time=False):
     renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, include_clbits, commuting)
 
     candidates = []
@@ -253,12 +255,17 @@ def schedule(circuit: QuantumCircuit, durations, network=None, include_clbits=Tr
         choose_host = host_chooser(order, meta)
         state = run_without_stalling(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host)
         if state is not None:
-            candidates.append(schedule_to_circuit(renamed_circuit, state, sessions_of, sessions))
+            candidates.append((state, schedule_to_circuit(renamed_circuit, state, sessions_of, sessions)))
         if buffer:
             state = run_without_stalling(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host,
                                          spare_slots_by_qpu(renamed_circuit, network))
             if state is not None:
-                candidates.append(schedule_to_circuit(renamed_circuit, state, sessions_of, sessions))
+                candidates.append((state, schedule_to_circuit(renamed_circuit, state, sessions_of, sessions)))
 
-    return best_of(renamed_circuit, candidates, durations, include_clbits)
+    if model is not None:
+        _, best = best_by_fidelity(candidates, renamed_circuit, sessions, sessions_of, model, per_unit_time)
+        makespan, entries = evaluate_quantum_runtime(best, durations, include_clbits)
+        return makespan, entries, best
+    return best_of(renamed_circuit, [scheduled for _, scheduled in candidates], durations, include_clbits)
+
 

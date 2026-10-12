@@ -41,6 +41,7 @@ def maybe_move_tail(state, session_id, meta, spare, epr_of, swap_time, reset_tim
     comm = state.host[session_id]
 
     state.moved[session_id] = comm
+    state.moved_at[session_id] = state.clock
     state.host[session_id] = slot
     state.held[slot] = session_id
     del state.held[comm]

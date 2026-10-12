@@ -1,26 +1,4 @@
-"""Partition a circuit across three QPUs, then schedule it with the deterministic scheduler.
-
-Every EPR pair takes exactly DURATIONS["EPR"] time units, so one run gives one schedule.
-The demo prints the makespan (the time the last instruction finishes) after each stage,
-with the percentage it took off the stage before:
-
-    as extracted               the circuit the extractor produced
-    classical bits renamed     each classical bit written only once
-    scheduled                  a session may use any communication qubit of its QPU;
-                               the session with the longest path to the end claims first
-    scheduled + commuting      the same, with commuting gates free to reorder
-    buffer                     on QPUs with spare data qubits, a waiting half-pair is
-                               parked on a spare qubit so its communication qubit is free
-
-Saved next to this file:
-
-    circuit.png                the logical circuit we started from
-    partition_result.png       the hypergraph, coloured by which QPU each qubit went to
-    <stage>_circuit.png        the circuit after each stage
-    <stage>_schedule.png       when each instruction runs, one lane per qubit
-    circuits.qpy               every stage's circuit, to load back with qpy.load
-"""
-
+import math
 from pathlib import Path
 
 import networkx as nx
@@ -33,7 +11,9 @@ from disqco import (
     set_initial_partition_assignment,
 )
 from disqco.circuits.cp_fraction import cp_fraction
+from disqco.scheduling.buffer import spare_slots_by_qpu
 from disqco.scheduling.draw_schedule import plot_schedule
+from disqco.scheduling.errors import ErrorModel, log_fidelity
 from disqco.scheduling.evaluator import evaluate_quantum_runtime
 from disqco.scheduling.schedule_to_circuit import schedule_to_circuit
 from disqco.scheduling.scheduler import (
@@ -48,6 +28,7 @@ from disqco.scheduling.scheduler import (
 demo_dir = Path(__file__).parent
 
 DURATIONS = {"u": 1, "cp": 2, "cx": 2, "swap": 6, "measure": 5, "EPR": 100}
+ERROR_MODEL = ErrorModel(T2_data=20000, T2_comm=2000, F_epr=0.98, F_meas=0.99, p2=0.003)
 
 NUM_QPUS = 3
 QPU_SIZE = 4
@@ -82,31 +63,45 @@ def save(circuit, name, runtime, schedule_entries):
     plot_schedule(circuit, schedule_entries, runtime, save_path=demo_dir / f"{name}_schedule.png")
 
 
-def scheduled_pass(partitioned_circuit, network, commuting):
+def scheduled_pass(partitioned_circuit, network, commuting, buffer=False):
     """One scheduling pass, longest path first, on the strict or the commuting graph.
 
-    Returns (circuit, runtime, schedule entries), or (None, None, None) if the pass stalled.
+    Returns (circuit, runtime, schedule entries, fidelity, log terms by error source),
+    or five Nones if the pass stalled.
     """
     renamed, sessions, session_of, meta, preds, succs, pool, priority = prepare(
         partitioned_circuit, DURATIONS, network, commuting=commuting)
 
     order = claim_order_by_priority(sessions, meta, priority)
+    spare = spare_slots_by_qpu(renamed, network) if buffer else None
     state = run_without_stalling(renamed, sessions, session_of, meta, preds, succs,
-                                 priority, DURATIONS, pool, host_chooser(order, meta))
+                                 priority, DURATIONS, pool, host_chooser(order, meta), spare)
     if state is None:
-        return None, None, None
+        return None, None, None, None, None
 
     scheduled_circuit = schedule_to_circuit(renamed, state, session_of, sessions)
     runtime, entries = evaluate_quantum_runtime(scheduled_circuit, DURATIONS)
-    return scheduled_circuit, runtime, entries
+    total, logs = log_fidelity(state, renamed, sessions, session_of, ERROR_MODEL)
+    return scheduled_circuit, runtime, entries, math.exp(total), logs
 
 
 def percent_off(runtime, against):
     return 100 * (against - runtime) / against
 
 
-def print_stage(label, runtime, against):
-    print("{:26}{:5}   {:.1f}%".format(label, runtime, percent_off(runtime, against)))
+def print_stage(label, runtime, against, fidelity=None):
+    line = "{:26}{:5}   {:.1f}%".format(label, runtime, percent_off(runtime, against))
+    if fidelity is not None:
+        line += "   F {:.3f}".format(fidelity)
+    print(line)
+
+
+def print_error_budget(label, logs):
+    """-log F by source: the fidelity lost to each kind of error."""
+    print("error budget of {}:".format(label))
+    for source, value in logs.items():
+        print("    {:18}{:7.3f}".format(source, -value))
+    print("    {:18}{:7.3f}   F {:.3f}".format("total", -sum(logs.values()), math.exp(sum(logs.values()))))
 
 
 circuit = cp_fraction(num_qubits=10, depth=14, fraction=0.6, seed=7)
@@ -130,12 +125,12 @@ renamed_circuit = rename_classical_bits(before_circuit)
 renamed_runtime, renamed_schedule = evaluate_quantum_runtime(renamed_circuit, DURATIONS)
 save(renamed_circuit, "renamed", renamed_runtime, renamed_schedule)
 
-scheduled_circuit, scheduled_runtime, scheduled_schedule = scheduled_pass(
+scheduled_circuit, scheduled_runtime, scheduled_schedule, scheduled_fidelity, _ = scheduled_pass(
     before_circuit, network, commuting=False)
 if scheduled_circuit is not None:
     save(scheduled_circuit, "scheduled", scheduled_runtime, scheduled_schedule)
 
-commuting_circuit, commuting_runtime, commuting_schedule = scheduled_pass(
+commuting_circuit, commuting_runtime, commuting_schedule, commuting_fidelity, commuting_logs = scheduled_pass(
     before_circuit, network, commuting=True)
 if commuting_circuit is not None:
     save(commuting_circuit, "scheduled_commuting", commuting_runtime, commuting_schedule)
@@ -143,10 +138,14 @@ if commuting_circuit is not None:
 roomy_network = build_network(QPU_SIZE + SPARE)
 roomy_circuit = extract(circuit, roomy_network, assignment)
 
-roomy_runtime, _, _ = schedule(roomy_circuit, DURATIONS, network=roomy_network, commuting=True)
-buffered_runtime, buffered_schedule, buffered_circuit = schedule(
-    roomy_circuit, DURATIONS, network=roomy_network, commuting=True, buffer=True)
+_, roomy_runtime, _, roomy_fidelity, _ = scheduled_pass(roomy_circuit, roomy_network, commuting=True)
+buffered_circuit, buffered_runtime, buffered_schedule, buffered_fidelity, buffered_logs = scheduled_pass(
+    roomy_circuit, roomy_network, commuting=True, buffer=True)
 save(buffered_circuit, "buffered", buffered_runtime, buffered_schedule)
+
+by_makespan_runtime, _, _ = schedule(roomy_circuit, DURATIONS, network=roomy_network, commuting=True, buffer=True)
+by_fidelity_runtime, _, _ = schedule(roomy_circuit, DURATIONS, network=roomy_network, commuting=True, buffer=True,
+                                     model=ERROR_MODEL)
 
 stages = [before_circuit, renamed_circuit, scheduled_circuit, commuting_circuit, buffered_circuit]
 with open(demo_dir / "circuits.qpy", "wb") as handle:
@@ -158,18 +157,26 @@ print_stage("classical bits renamed:", renamed_runtime, before_runtime)
 if scheduled_runtime is None:
     print("scheduled:                stalled on this circuit")
 else:
-    print_stage("scheduled:", scheduled_runtime, renamed_runtime)
+    print_stage("scheduled:", scheduled_runtime, renamed_runtime, scheduled_fidelity)
 if commuting_runtime is None:
     print("scheduled + commuting:    stalled on this circuit")
 else:
-    print_stage("scheduled + commuting:", commuting_runtime, scheduled_runtime or renamed_runtime)
+    print_stage("scheduled + commuting:", commuting_runtime, scheduled_runtime or renamed_runtime, commuting_fidelity)
     print("total improvement: {:.1f}%".format(percent_off(commuting_runtime, before_runtime)))
 
 print("--- with {} spare data qubits per QPU".format(SPARE))
-print("{:26}{:5}".format("no buffer:", roomy_runtime))
-print_stage("buffer:", buffered_runtime, roomy_runtime)
+print("{:26}{:5}           F {:.3f}".format("no buffer:", roomy_runtime, roomy_fidelity))
+print_stage("buffer:", buffered_runtime, roomy_runtime, buffered_fidelity)
 moves = buffered_circuit.count_ops().get("swap", 0)
 print("half-pairs moved onto slots:", moves, "of", buffered_circuit.count_ops().get("EPR", 0) * 2, "sessions")
+
+print("---------------------------------------------")
+print_error_budget("scheduled + commuting", commuting_logs)
+print_error_budget("buffer", buffered_logs)
+
+print("---------------------------------------------")
+print("schedule() keeps the shortest:        makespan", by_makespan_runtime)
+print("schedule() keeps the highest fidelity: makespan", by_fidelity_runtime)
 
 assert buffered_circuit.count_ops().get("reset", 0) == roomy_circuit.count_ops().get("reset", 0) + moves
 assert len(buffered_circuit.data) == len(roomy_circuit.data) + 2 * moves

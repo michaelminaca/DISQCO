@@ -1,27 +1,34 @@
 import heapq
+import math
 import random
 from enum import IntEnum
 from disqco.scheduling.buffer import BufferEvent, maybe_move_tail, spare_slots_by_qpu
+from disqco.scheduling.decay import use_by_time_of_pair
+from disqco.scheduling.errors import ErrorModel, fidelity
 from disqco.scheduling.evaluator import duration_of, wires_of
 from disqco.scheduling.scheduler import (ScheduleState, claim_order_by_priority, claims_to_start, host_chooser,
                                          instruction_finished, prepare, start_instruction)
-from disqco.scheduling.sessions import sessions_ending_at, sessions_opening_at
+from disqco.scheduling.sessions import first_instruction_using_the_pair, sessions_ending_at, sessions_opening_at
 
 
 class EPREvent(IntEnum):
     TIMED_OUT = -3
 
 class StochasticScheduleState(ScheduleState):
-    def __init__(self, num_instructions, preds, mean, p, cutoff, trial):
+    def __init__(self, num_instructions, preds, mean, p, cutoff, trial, error_model):
         super().__init__(num_instructions, preds)
         self.attempt = mean * p
         self.p = p
         self.cutoff = cutoff
         self.trial = trial
+        self.error_model = error_model
+        self.coherence_budget = None if cutoff is None else cutoff / error_model.T2_comm
         self.random_of_epr = {}
         self.epr_generated_at = {}
         self.discards = 0
         self.finished = set()
+
+
 
 def random_duration_of_epr(state, epr):
     """Calculate total time to generate an epr """
@@ -41,14 +48,6 @@ def durations_for_instruction(state, idx, durations, sessions_opening_from_instr
     durations_with_overridden_epr["EPR"] = random_duration_of_epr(state, idx)
     return durations_with_overridden_epr
 
-def first_instruction_using_the_pair(circuit, sessions, session_of, session_id):
-    "returns the first inst for a given session that touches a data qubit"
-    tail = sessions[session_id][1:]
-    for idx in tail:
-        if any(session_of.get((idx, qubit)) != session_id for qubit in circuit.data[idx].qubits):
-            return idx
-    return tail[-1]
-
 def epr_used(state, epr, circuit, sessions, session_of, sessions_opening_from_instruction):
     """The epr is used if any of the 2 sessions have a multi-qubit gate from them to a data qubit"""
     for session_id in sessions_opening_from_instruction[epr]:
@@ -57,11 +56,12 @@ def epr_used(state, epr, circuit, sessions, session_of, sessions_opening_from_in
             return True
     return False
 
-def epr_generated(state, epr):
+def epr_generated(state, epr, sessions_opening_from_instruction):
     """called when an epr is successfully generated. Bookkeeping as well as adds the timeout event to the heap."""
     state.epr_generated_at[epr] = state.clock
     if state.cutoff is not None:
-        heapq.heappush(state.running, (state.clock + state.cutoff, EPREvent.TIMED_OUT, epr))
+        use_by_time = use_by_time_of_pair(state, epr, sessions_opening_from_instruction)
+        heapq.heappush(state.running, (use_by_time, EPREvent.TIMED_OUT, epr))
 
 def undo_instruction(state, idx, succs):
     if idx in state.finished:
@@ -93,6 +93,7 @@ def epr_timed_out(state, epr, circuit, sessions, session_of, succs, sessions_ope
             del state.held[slot]
             state.occupy(slot, state.clock + reset_time)
             del state.moved[session_id]
+            del state.moved_at[session_id]
             del state.host[session_id]
 
     undo_instruction(state, epr, succs)
@@ -107,7 +108,14 @@ def finish_instructions_at_clock(state, circuit, sessions, session_of, succs, se
         if isinstance(idx_or_kind, BufferEvent):
             continue
         if idx_or_kind == EPREvent.TIMED_OUT:
-            epr_timed_out(state, rest[0], circuit, sessions, session_of, succs, sessions_opening_from_instruction, reset_time)
+            epr = rest[0]
+            if epr_used(state, epr, circuit, sessions, session_of, sessions_opening_from_instruction):
+                continue
+            use_by_time = use_by_time_of_pair(state, epr, sessions_opening_from_instruction)
+            if use_by_time > state.clock:
+                heapq.heappush(state.running, (use_by_time, EPREvent.TIMED_OUT, epr))
+                continue
+            epr_timed_out(state, epr, circuit, sessions, session_of, succs, sessions_opening_from_instruction, reset_time)
             continue
         if state.end[idx_or_kind] != time or idx_or_kind in state.finished:
             continue
@@ -115,19 +123,20 @@ def finish_instructions_at_clock(state, circuit, sessions, session_of, succs, se
         instruction_finished(state, idx_or_kind, succs, sessions_closing_from_instruction, sessions_opening_from_instruction,
                              meta, spare, epr_of, swap_time, reset_time)
         if idx_or_kind in sessions_opening_from_instruction:
-            epr_generated(state, idx_or_kind)
+            epr_generated(state, idx_or_kind, sessions_opening_from_instruction)
 
 
 def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, pool, choose_host, spare=None,
-        mean=100, p=1.0, cutoff=None, trial=0):
+        mean=100, p=1.0, cutoff=None, trial=0, error_model=None):
     circuit_wires = [wires_of(instruction) for instruction in circuit.data]
     sessions_opening_from_instruction = sessions_opening_at(sessions)
     sessions_closing_from_instruction = sessions_ending_at(sessions)
     epr_of = [instructions[0] for instructions in sessions]
     spare = spare or {}
     swap_time, reset_time = duration_of("swap", durations), duration_of("reset", durations)
-    state = StochasticScheduleState(len(circuit.data), preds, mean, p, cutoff, trial)
-
+    error_model = error_model or ErrorModel()
+    state = StochasticScheduleState(len(circuit.data), preds, mean, p, cutoff, trial, error_model)
+    
     while state.ready or state.running:
         started_anything = True
         while started_anything:
@@ -151,21 +160,30 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
     return state
 
 
-def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=None, commuting=True, buffer=False):
+def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=None, commuting=True, buffer=False, error_model=None):
     """returns (makespan, discards, state)"""
     renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, True, commuting)
     choose_host = host_chooser(claim_order_by_priority(sessions, meta, priority), meta)
     spare = spare_slots_by_qpu(renamed_circuit, network) if buffer else None
     state = run(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host, spare,
-                mean, p, cutoff, trial)
+                mean, p, cutoff, trial, error_model)
     return max(state.end), state.discards, state
 
-
-def simulate_many(circuit, durations, trials=100, **options):
-    makespans, discards = [], []
+def simulate_many(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None):
+    renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, True, commuting)
+    choose_host = host_chooser(claim_order_by_priority(sessions, meta, priority), meta)
+    spare = spare_slots_by_qpu(renamed_circuit, network) if buffer else None
+    makespans, discards, log_fidelities = [], [], []
     for trial in range(trials):
-        makespan, discarded, _ = simulate(circuit, durations, trial=trial, **options)
-        makespans.append(makespan)
-        discards.append(discarded)
+        state = run(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host, spare,
+                    mean, p, cutoff, trial, error_model)
+        makespans.append(max(state.end))
+        discards.append(state.discards)
+        if error_model is not None:
+            log_fidelities.append(math.log(fidelity(state, renamed_circuit, sessions, sessions_of, error_model)))
     makespans.sort()
-    return {"mean": sum(makespans) / trials, "p90": makespans[int(0.9 * (trials - 1))], "discards": sum(discards) / trials}
+    summary = {"mean": sum(makespans) / trials, "p90": makespans[int(0.9 * (trials - 1))], "discards": sum(discards) / trials}
+    if error_model is not None:
+        summary["fidelity"] = math.exp(sum(log_fidelities) / trials)
+        summary["rate"] = summary["fidelity"] / summary["mean"]
+    return summary
