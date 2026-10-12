@@ -1,0 +1,226 @@
+import heapq
+import math
+import random
+from enum import IntEnum
+from disqco.scheduling.errors import ErrorModel, fidelity
+from disqco.scheduling.evaluator import duration_of, wires_of
+from disqco.scheduling.scheduler import (ScheduleState, claim_order_by_priority, claims_to_start, first_instruction_may_start, host_chooser, prepare, start_instruction)
+from disqco.scheduling.sessions import first_instruction_using_the_pair, sessions_ending_at, sessions_opening_at
+from disqco.scheduling.buffer import BufferEvent, expected_wait_until_pair_is_used, move_tail_if_it_pays, spare_slots_by_qpu
+from disqco.scheduling.decay import use_by_time_of_pair
+from disqco.scheduling.helper import ancestor_eprs, instructions_to_start_before_first_instruction_on_data
+
+class EPREvent(IntEnum):
+    TIMED_OUT = -3
+
+class StochasticScheduleState(ScheduleState):
+    def __init__(self, num_instructions, preds, mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff):
+        super().__init__(num_instructions, preds)
+        self.attempt = mean * p
+        self.p = p
+        self.mean = mean
+        self.cutoff = cutoff
+        self.trial = trial
+        self.error_model = error_model
+        self.coherence_budget = None if cutoff is None else cutoff / error_model.T2_comm
+        self.random_of_epr = {}
+        self.epr_generated_at = {}
+        self.discards = 0
+        self.timeouts_kept_through_of_epr = {}
+        self.finished = set()
+        self.max_timeouts_pair_kept_beyond_cutoff = max_timeouts_pair_kept_beyond_cutoff
+
+
+def random_duration_of_epr(state, epr):
+    """Calculate total time to generate an epr """
+    if epr not in state.random_of_epr:
+        state.random_of_epr[epr] = random.Random("trial %d, epr %d" % (state.trial, epr))
+    stream = state.random_of_epr[epr]
+    attempts = 1
+    while stream.random() > state.p:
+        attempts += 1
+    return attempts * state.attempt
+
+def durations_for_instruction(state, idx, durations, sessions_opening_from_instruction):
+    """durations of each type of instruction but overrides the EPR with a stochastic generation"""
+    if idx not in sessions_opening_from_instruction:
+        return durations
+    durations_with_overridden_epr = dict(durations)
+    durations_with_overridden_epr["EPR"] = random_duration_of_epr(state, idx)
+    return durations_with_overridden_epr
+
+def epr_used(state, epr, circuit, sessions, session_of, sessions_opening_from_instruction):
+    """The epr is used if any of the 2 sessions have a multi-qubit gate from them to a data qubit"""
+    for session_id in sessions_opening_from_instruction[epr]:
+        idx = first_instruction_using_the_pair(circuit, sessions, session_of, session_id)
+        if state.start[idx] is not None:
+            return True
+    return False
+
+def epr_generated(state, epr, sessions_opening_from_instruction):
+    """called when an epr is successfully generated. Bookkeeping as well as adds the timeout event to the heap."""
+    state.epr_generated_at[epr] = state.clock
+    state.timeouts_kept_through_of_epr[epr] = 0
+    if state.cutoff is not None:
+        use_by_time = use_by_time_of_pair(state, epr, sessions_opening_from_instruction)
+        heapq.heappush(state.running, (use_by_time, EPREvent.TIMED_OUT, epr))
+
+def undo_instruction(state, idx, succs):
+    if idx in state.finished:
+        for successor in succs[idx]:
+            state.indeg[successor] += 1
+            state.ready.discard(successor)
+        state.finished.discard(idx)
+    state.start[idx] = None
+    state.end[idx] = None
+
+def tail_instructions_already_run(state, circuit, sessions, session_of, session_id):
+    """Called when an epr times out. Returns the indexes of instructions that have already run in the sessions tail"""
+    consumer = first_instruction_using_the_pair(circuit, sessions, session_of, session_id)
+    tail = sessions[session_id][1:]
+    return [idx for idx in tail[:tail.index(consumer)] if state.start[idx] is not None]
+
+
+def epr_timed_out(state, epr, circuit, sessions, session_of, succs, sessions_opening_from_instruction, reset_time):
+    """Called when an epr times out event is popped from the state heap."""
+    if epr_used(state, epr, circuit, sessions, session_of, sessions_opening_from_instruction):
+        return
+
+    for session_id in sessions_opening_from_instruction[epr]:
+        for idx in reversed(tail_instructions_already_run(state, circuit, sessions, session_of, session_id)):
+            undo_instruction(state, idx, succs)
+        if session_id in state.moved:
+            # session was buffered
+            slot = state.host[session_id]
+            del state.held[slot]
+            state.occupy(slot, state.clock + reset_time)
+            del state.moved[session_id]
+            del state.moved_at[session_id]
+            del state.host[session_id]
+
+    undo_instruction(state, epr, succs)
+    state.ready.add(epr)
+    state.discards += 1
+
+def time_to_check_the_pair_again(state, epr, sessions_opening_from_instruction, consumer_of_session, eprs_before_consumer, preds):
+    """at a timeout if expected time to use the pair is less than the mean of generating a new pair then push a new timeout event to the heap to recheck it later. Otherwise return None."""
+    if state.timeouts_kept_through_of_epr[epr] >= state.max_timeouts_pair_kept_beyond_cutoff:
+        return None
+    expected_wait_until_used = expected_wait_until_pair_is_used(state, epr, sessions_opening_from_instruction, consumer_of_session, eprs_before_consumer, preds)
+    if expected_wait_until_used >= state.mean:
+        return None
+    state.timeouts_kept_through_of_epr[epr] += 1
+    return state.clock + max(expected_wait_until_used, state.attempt)
+
+
+def instruction_finished(state, idx, succs, sessions_closing_from_instruction, sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time, consumer_of_session, eprs_before_consumer, preds):
+    for successor in succs[idx]:
+        state.indeg[successor] -= 1
+        if state.indeg[successor] == 0:
+            state.ready.add(successor)
+
+    for session_id in sessions_closing_from_instruction.get(idx, []):
+        del state.held[state.host[session_id]]
+
+    for session_id in sessions_opening_from_instruction.get(idx, []):
+        move_tail_if_it_pays(state, session_id, meta, spare, epr_of, swap_time, reset_time,
+                             consumer_of_session, eprs_before_consumer, preds)
+
+
+def finish_instructions_at_clock(state, circuit, sessions, session_of, succs, sessions_closing_from_instruction, sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time, consumer_of_session, eprs_before_consumer, preds):
+    while state.running and state.next_finish() == state.clock:
+        time, idx_or_kind, *rest = heapq.heappop(state.running)
+        if isinstance(idx_or_kind, BufferEvent):
+            continue
+
+        if idx_or_kind == EPREvent.TIMED_OUT:
+            epr = rest[0]
+            if epr_used(state, epr, circuit, sessions, session_of, sessions_opening_from_instruction):
+                continue
+            use_by_time = use_by_time_of_pair(state, epr, sessions_opening_from_instruction)
+            if use_by_time > state.clock:   # happens when a epr is swapped onto a data qubit with higher T2
+                heapq.heappush(state.running, (use_by_time, EPREvent.TIMED_OUT, epr))
+                continue
+            check_again_at = time_to_check_the_pair_again(state, epr, sessions_opening_from_instruction, consumer_of_session, eprs_before_consumer, preds)
+            if check_again_at is not None:
+                heapq.heappush(state.running, (check_again_at, EPREvent.TIMED_OUT, epr))
+                continue
+            epr_timed_out(state, epr, circuit, sessions, session_of, succs, sessions_opening_from_instruction, reset_time)
+            continue
+
+        if state.end[idx_or_kind] != time or idx_or_kind in state.finished:
+            continue
+        state.finished.add(idx_or_kind)
+        instruction_finished(state, idx_or_kind, succs, sessions_closing_from_instruction, sessions_opening_from_instruction,
+                             meta, spare, epr_of, swap_time, reset_time, consumer_of_session, eprs_before_consumer, preds)
+        if idx_or_kind in sessions_opening_from_instruction:
+            epr_generated(state, idx_or_kind, sessions_opening_from_instruction)
+
+
+def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, pool, choose_host, spare=None,
+        mean=100, p=1.0, cutoff=None, trial=0, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True):
+    circuit_wires = [wires_of(instruction) for instruction in circuit.data]
+    sessions_opening_from_instruction = sessions_opening_at(sessions)
+    sessions_closing_from_instruction = sessions_ending_at(sessions)
+    epr_of = [instructions[0] for instructions in sessions]
+    consumer_of_session = {session_id: first_instruction_using_the_pair(circuit, sessions, session_of, session_id) for session_id in range(len(sessions))}
+    ancestors = ancestor_eprs(circuit, preds, sessions_opening_from_instruction)
+    eprs_before_consumer = {consumer: ancestors[consumer] - {epr_of[session_id]} for session_id, consumer in consumer_of_session.items()}
+    spare = spare or {}
+    swap_time, reset_time = duration_of("swap", durations), duration_of("reset", durations)
+    error_model = error_model or ErrorModel()
+    instructions_to_start_before_first_instruction = instructions_to_start_before_first_instruction_on_data(circuit, session_of, preds) if lazy_first_instructions else {}
+    state = StochasticScheduleState(len(circuit.data), preds, mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff)
+
+    while state.ready or state.running:
+        started_anything = True
+        while started_anything:
+            started_anything = False
+            for idx in sorted(state.ready, key=lambda i: -priority[i]):
+                if not first_instruction_may_start(state, idx, instructions_to_start_before_first_instruction):
+                    continue
+                claims = claims_to_start(state, idx, circuit_wires, session_of, meta, pool, choose_host)
+                if claims is None:
+                    continue
+
+                start_instruction(state, idx, claims, circuit, circuit_wires, session_of,
+                                  durations_for_instruction(state, idx, durations, sessions_opening_from_instruction))
+                started_anything = True
+
+        if state.running:
+            state.clock = state.next_finish()
+            finish_instructions_at_clock(state, circuit, sessions, session_of, succs, sessions_closing_from_instruction,
+                                         sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time,
+                                         consumer_of_session, eprs_before_consumer, preds)
+        elif state.ready:
+            raise RuntimeError("stalled")
+
+    return state
+
+def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True):
+    """returns (makespan, discards, state)"""
+    renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, True, commuting)
+    choose_host = host_chooser(claim_order_by_priority(sessions, meta, priority), meta)
+    spare = spare_slots_by_qpu(renamed_circuit, network) if buffer else None
+    state = run(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host, spare,
+                mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff, lazy_first_instructions)
+    return max(state.end), state.discards, state
+
+def simulate_many(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True):
+    renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, True, commuting)
+    choose_host = host_chooser(claim_order_by_priority(sessions, meta, priority), meta)
+    spare = spare_slots_by_qpu(renamed_circuit, network) if buffer else None
+    makespans, discards, log_fidelities = [], [], []
+    for trial in range(trials):
+        state = run(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host, spare,
+                    mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff, lazy_first_instructions)
+        makespans.append(max(state.end))
+        discards.append(state.discards)
+        if error_model is not None:
+            log_fidelities.append(math.log(fidelity(state, renamed_circuit, sessions, sessions_of, error_model)))
+    makespans.sort()
+    summary = {"mean": sum(makespans) / trials, "p90": makespans[int(0.9 * (trials - 1))], "discards": sum(discards) / trials}
+    if error_model is not None:
+        summary["fidelity"] = math.exp(sum(log_fidelities) / trials)
+        summary["rate"] = summary["fidelity"] / summary["mean"]
+    return summary

@@ -95,3 +95,11 @@ def sessions_ending_at(sessions):
             ending[last_inst] = []
         ending[last_inst].append(session_id)
     return ending
+
+def first_instruction_using_the_pair(circuit, sessions, session_of, session_id):
+    "returns the first inst for a given session that touches a data qubit"
+    tail = sessions[session_id][1:]
+    for idx in tail:
+        if any(session_of.get((idx, qubit)) != session_id for qubit in circuit.data[idx].qubits):
+            return idx
+    return tail[-1]
