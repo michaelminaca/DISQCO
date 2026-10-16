@@ -4,7 +4,7 @@ import random
 from enum import IntEnum
 from disqco.scheduling.errors import ErrorModel, fidelity
 from disqco.scheduling.evaluator import duration_of, wires_of
-from disqco.scheduling.scheduler import (ScheduleState, claim_order_by_priority, claims_to_start, first_instruction_may_start, host_chooser, prepare, start_instruction)
+from disqco.scheduling.scheduler import (ScheduleState, claim_order_by_circuit, claim_order_by_priority, claims_to_start, first_instruction_may_start, host_chooser, prepare, start_instruction)
 from disqco.scheduling.sessions import first_instruction_using_the_pair, sessions_ending_at, sessions_opening_at
 from disqco.scheduling.buffer import BufferEvent, expected_wait_until_pair_is_used, move_tail_if_it_pays, spare_slots_by_qpu
 from disqco.scheduling.decay import use_by_time_of_pair
@@ -197,18 +197,21 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
 
     return state
 
-def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True):
+def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True,
+             claim_order="priority"):
     """returns (makespan, discards, state)"""
     renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, True, commuting)
-    choose_host = host_chooser(claim_order_by_priority(sessions, meta, priority), meta)
+    order = claim_order_by_circuit(sessions, meta) if claim_order == "circuit" else claim_order_by_priority(sessions, meta, priority)
+    choose_host = host_chooser(order, meta)
     spare = spare_slots_by_qpu(renamed_circuit, network) if buffer else None
     state = run(renamed_circuit, sessions, sessions_of, meta, preds, succs, priority, durations, pool, choose_host, spare,
                 mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff, lazy_first_instructions)
     return max(state.end), state.discards, state
 
-def simulate_many(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True):
+def simulate_many(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True, claim_order="priority"):
     renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, True, commuting)
-    choose_host = host_chooser(claim_order_by_priority(sessions, meta, priority), meta)
+    order = claim_order_by_circuit(sessions, meta) if claim_order == "circuit" else claim_order_by_priority(sessions, meta, priority)
+    choose_host = host_chooser(order, meta)
     spare = spare_slots_by_qpu(renamed_circuit, network) if buffer else None
     makespans, discards, log_fidelities = [], [], []
     for trial in range(trials):
@@ -224,3 +227,12 @@ def simulate_many(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, 
         summary["fidelity"] = math.exp(sum(log_fidelities) / trials)
         summary["rate"] = summary["fidelity"] / summary["mean"]
     return summary
+
+def simulate_many_best(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True):
+    """simulate_many with the priority and the circuit claim order on the same trials, returns (claim order, summary) of the one with the lower mean makespan"""
+    summary_of_claim_order = {}
+    for claim_order in ("priority", "circuit"):
+        summary_of_claim_order[claim_order] = simulate_many(circuit, durations, trials, mean, p, cutoff, network, commuting, buffer, error_model,
+                                                            max_timeouts_pair_kept_beyond_cutoff, lazy_first_instructions, claim_order)
+    best_claim_order = min(summary_of_claim_order, key=lambda claim_order: summary_of_claim_order[claim_order]["mean"])
+    return best_claim_order, summary_of_claim_order[best_claim_order]

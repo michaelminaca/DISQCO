@@ -25,6 +25,7 @@ from disqco.scheduling.scheduler import (
     schedule,
 )
 from disqco.scheduling.stochastic_scheduler import run as run_online
+from disqco.scheduling.stochastic_scheduler import simulate_many, simulate_many_best
 
 demo_dir = Path(__file__).parent
 
@@ -188,6 +189,13 @@ by_fidelity_runtime, _, _ = schedule(roomy_circuit, DURATIONS, network=roomy_net
 by_fidelity_lazy_runtime, _, _ = schedule(roomy_circuit, DURATIONS, network=roomy_network, commuting=True, buffer=True,
                                           model=ERROR_MODEL, lazy_first_instructions=True)
 
+ONLINE_SETTINGS = dict(trials=1, mean=DURATIONS["EPR"], p=1.0, cutoff=None, network=roomy_network, commuting=True, buffer=True,
+                       error_model=ERROR_MODEL, max_timeouts_pair_kept_beyond_cutoff=MAX_TIMEOUTS_PAIR_KEPT_BEYOND_CUTOFF,
+                       lazy_first_instructions=True)
+summary_of_claim_order = {claim_order: simulate_many(roomy_circuit, DURATIONS, claim_order=claim_order, **ONLINE_SETTINGS)
+                          for claim_order in ("priority", "circuit")}
+best_claim_order, best_summary = simulate_many_best(roomy_circuit, DURATIONS, **ONLINE_SETTINGS)
+
 stages = [before_circuit, renamed_circuit, scheduled_circuit, commuting_circuit, buffered_circuit, gated_circuit,
           lazy_circuit]
 with open(demo_dir / "circuits.qpy", "wb") as handle:
@@ -229,3 +237,9 @@ print("schedule() keeps the highest fidelity, lazy first instructions: makespan"
 moves = buffered_circuit.count_ops().get("swap", 0)
 assert buffered_circuit.count_ops().get("reset", 0) == roomy_circuit.count_ops().get("reset", 0) + moves
 assert len(buffered_circuit.data) == len(roomy_circuit.data) + 2 * moves
+
+print("---------------------------------------------")
+print("claim order, buffer if it pays + lazy first instructions:")
+for claim_order, summary in summary_of_claim_order.items():
+    print("    {:28}{:5.0f}           F {:.3f}".format(claim_order + ":", summary["mean"], summary["fidelity"]))
+print("simulate_many_best() keeps:     {}   makespan {:.0f}".format(best_claim_order, best_summary["mean"]))
