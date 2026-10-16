@@ -9,6 +9,7 @@ from disqco.scheduling.sessions import first_instruction_using_the_pair, session
 from disqco.scheduling.buffer import BufferEvent, expected_wait_until_pair_is_used, move_tail_if_it_pays, spare_slots_by_qpu
 from disqco.scheduling.decay import use_by_time_of_pair
 from disqco.scheduling.helper import ancestor_eprs, instructions_to_start_before_first_instruction_on_data
+from disqco.scheduling.validation import validate_schedule
 
 class EPREvent(IntEnum):
     TIMED_OUT = -3
@@ -52,9 +53,9 @@ def durations_for_instruction(state, idx, durations, sessions_opening_from_instr
 def epr_used(state, epr, circuit, sessions, session_of, sessions_opening_from_instruction):
     """The epr is used if any of the 2 sessions have a multi-qubit gate from them to a data qubit"""
     for session_id in sessions_opening_from_instruction[epr]:
-        idx = first_instruction_using_the_pair(circuit, sessions, session_of, session_id)
-        if state.start[idx] is not None:
-            return True
+        for idx in sessions[session_id][1:]:
+            if state.start[idx] is not None and any(session_of.get((idx, qubit)) != session_id for qubit in circuit.data[idx].qubits):
+                return True
     return False
 
 def epr_generated(state, epr, sessions_opening_from_instruction):
@@ -76,9 +77,7 @@ def undo_instruction(state, idx, succs):
 
 def tail_instructions_already_run(state, circuit, sessions, session_of, session_id):
     """Called when an epr times out. Returns the indexes of instructions that have already run in the sessions tail"""
-    consumer = first_instruction_using_the_pair(circuit, sessions, session_of, session_id)
-    tail = sessions[session_id][1:]
-    return [idx for idx in tail[:tail.index(consumer)] if state.start[idx] is not None]
+    return [idx for idx in sessions[session_id][1:] if state.start[idx] is not None]
 
 
 def epr_timed_out(state, epr, circuit, sessions, session_of, succs, sessions_opening_from_instruction, reset_time):
@@ -195,6 +194,7 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
         elif state.ready:
             raise RuntimeError("stalled")
 
+    validate_schedule(state, preds, circuit, sessions, session_of, swap_time, reset_time)
     return state
 
 def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True,
