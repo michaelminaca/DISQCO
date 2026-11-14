@@ -1,5 +1,6 @@
 import math
-from disqco.scheduling.sessions import sessions_opening_at, first_instruction_using_the_pair
+from disqco.scheduling.sessions import sessions_opening_at
+from disqco.scheduling.distillation import consumer_of_half, raw_pair_instructions
 
 
 class ErrorModel:
@@ -20,7 +21,7 @@ def swap_error_cost(error_model):
     return -3 * math.log(1 - error_model.p2)
 
 def two_qubit_gates(circuit):
-    return sum(1 for inst in circuit.data if len(inst.qubits) == 2 and inst.operation.name != "EPR")
+    return sum(len(inst.qubits) - 1 for inst in circuit.data if len(inst.qubits) >= 2 and inst.operation.name != "EPR")
 
 
 def idle_of_each_data_qubit(state, circuit, session_of):
@@ -47,9 +48,24 @@ def hold_of_each_half(state, circuit, sessions, session_of):
     for epr, session_ids in sessions_opening_at(sessions).items():
         herald = herald_of(state, epr)
         for session_id in session_ids:
-            consumer = first_instruction_using_the_pair(circuit, sessions, session_of, session_id)
+            consumer = consumer_of_half(circuit, sessions, session_of, session_id)
             holds.append((state.start[consumer] - herald, session_id in state.moved))
     return holds
+
+
+def times_on_comm_and_slot(state, circuit, sessions, session_of):
+    times = []
+    for epr, session_ids in sessions_opening_at(sessions).items():
+        herald = herald_of(state, epr)
+        for session_id in session_ids:
+            used_at = state.start[consumer_of_half(circuit, sessions, session_of, session_id)]
+            moved_at = state.moved_at[session_id] if session_id in state.moved else used_at
+            times.append((moved_at - herald, used_at - moved_at))
+    return times
+
+
+def decay_fidelity_of_half(time_on_comm, time_on_slot, model):
+    return (1 + math.exp(-(time_on_comm / model.T2_comm + time_on_slot / model.T2_data))) / 2
 
 
 def log_fidelity(state, circuit, sessions, session_of, model):
@@ -57,10 +73,10 @@ def log_fidelity(state, circuit, sessions, session_of, model):
     logs = {}
     idle = idle_of_each_data_qubit(state, circuit, session_of)
     logs["idle dephasing"] = sum(math.log(dephasing_fidelity(t, model.T2_data)) for t in idle.values())
-    holds = hold_of_each_half(state, circuit, sessions, session_of)
-    logs["pair decay"] = sum(math.log(dephasing_fidelity(hold, model.T2_data if on_slot else model.T2_comm)) for hold, on_slot in holds)
+    times = times_on_comm_and_slot(state, circuit, sessions, session_of)
+    logs["pair decay"] = sum(math.log(decay_fidelity_of_half(on_comm, on_slot, model)) for on_comm, on_slot in times)
     pairs = len(sessions_opening_at(sessions))
-    logs["pair infidelity"] = pairs * math.log(model.F_epr)
+    logs["pair infidelity"] = (pairs - len(raw_pair_instructions(circuit))) * math.log(model.F_epr)
     logs["measurement"] = 2 * pairs * math.log(model.F_meas)
     logs["two-qubit gates"] = (two_qubit_gates(circuit) + 3 * len(state.moved)) * math.log(1 - model.p2)
     return sum(logs.values()), logs

@@ -1,11 +1,12 @@
 import matplotlib.pyplot as plt
 
 KIND_COLORS = {"EPR": "#2a78d6", "swap": "#eb6834", "two-qubit": "#1baf7a",
-               "classical": "#eda100", "single-qubit": "#b0afa9"}
+               "classical": "#eda100", "single-qubit": "#b0afa9", "distill": "#7d4fc4"}
 
 def kind_of(name):
     if name == "EPR": return "EPR"
     if name == "swap": return "swap"
+    if name == "distill": return "distill"
     if name in ("cp", "cx", "cz"): return "two-qubit"
     if name in ("measure", "reset", "x", "z"): return "classical"  # corrections
     return "single-qubit"

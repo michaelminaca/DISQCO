@@ -2,6 +2,9 @@ from qiskit import QuantumCircuit
 
 from disqco.scheduling.evaluator import evaluate_quantum_runtime
 
+def started_before_the_move(state, idx, session_id):
+    return state.start[idx] < state.moved_at[session_id]
+
 def rehosted_qubits(inst, idx, session_of, state, epr_of):
     qubits = []
     for qubit in inst.qubits:
@@ -9,7 +12,7 @@ def rehosted_qubits(inst, idx, session_of, state, epr_of):
         if session_id is None:
             # Data or wire no session, put back to where it should be
             qubits.append(qubit)
-        elif session_id in state.moved and idx == epr_of[session_id]:
+        elif session_id in state.moved and started_before_the_move(state, idx, session_id):
             # comm qubit epr tail moved to other: state.moved[session_Id] is original comm and state.host[session_id] is the new
             qubits.append(state.moved[session_id])
         else:
@@ -21,9 +24,9 @@ def schedule_to_circuit(circuit: QuantumCircuit, state, session_of, sessions=Non
     epr_of = [instrutions[0] for instrutions in sessions or []]
     events = [(state.start[idx], 0, idx, idx) for idx in range(len(circuit.data))]
     for session_id, comm in state.moved.items():
-        ends = state.end[epr_of[session_id]]
-        events.append((ends, 1, session_id, ("swap", comm, state.host[session_id])))
-        events.append((ends, 2, session_id, ("reset", comm)))
+        moved_at = state.moved_at[session_id]
+        events.append((moved_at, 1, session_id, ("swap", comm, state.host[session_id])))
+        events.append((moved_at, 2, session_id, ("reset", comm)))
     events.sort(key=lambda event: event[:3])
 
     new_circuit = circuit.copy_empty_like()

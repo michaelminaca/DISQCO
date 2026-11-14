@@ -2,12 +2,15 @@ from qiskit import QuantumCircuit
 from qiskit.circuit import CommutationChecker
 
 _checker = CommutationChecker()
+DISTILL = "distill"
 
 def operation_commutes(inst_a, inst_b):
     """Returns true if two instructions commute and false otherwise"""
     if inst_a.clbits or inst_b.clbits:
         return False
     if getattr(inst_a.operation, "condition", None) or getattr(inst_b.operation, "condition", None):
+        return False
+    if DISTILL in (inst_a.operation.name, inst_b.operation.name):
         return False
     return _checker.commute(inst_a.operation, inst_a.qubits, inst_a.clbits, 
                             inst_b.operation, inst_b.qubits, inst_b.clbits)

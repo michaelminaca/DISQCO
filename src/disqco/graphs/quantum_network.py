@@ -307,6 +307,14 @@ class QuantumNetwork():
 
     #     return tree
 
+    def root_reaches_every_target(self, root_p, target_partitions):
+        return all(self.qpu_graph.has_edge(root_p, p) for p in target_partitions if p != root_p)
+
+    def star_from_root(self, root_p, target_partitions):
+        star = nx.Graph()
+        star.add_edges_from((root_p, p) for p in sorted(set(target_partitions)) if p != root_p)
+        return star
+
     def get_full_tree(self, 
                     root_p : int,
                     target_partitions : list[int]) -> nx.Graph:
@@ -323,6 +331,9 @@ class QuantumNetwork():
         :return: A set of edges representing the full tree.
         :rtype: set[tuple[int,int]]
         """
+
+        if self.root_reaches_every_target(root_p, target_partitions):
+            return self.star_from_root(root_p, target_partitions)
 
         terminal_nodes = [root_p] + target_partitions
 

@@ -168,6 +168,17 @@ def first_instruction_may_start(state, idx, instructions_to_start_before):
         return True
     return all(state.start[other] is not None for other in instructions_to_start_before[idx])
 
+def release_lazy_holds(state, instructions_to_start_before):
+    held_back = [idx for idx in state.ready if not first_instruction_may_start(state, idx, instructions_to_start_before)]
+    for idx in held_back:
+        del instructions_to_start_before[idx]
+    return bool(held_back)
+
+def release_holds_if_pair_on_the_way(state, instructions_to_start_before, instructions_that_also_let_it_start):
+    for idx in [idx for idx in instructions_to_start_before if idx in instructions_that_also_let_it_start]:
+        if any(all(state.start[other] is not None for other in others) for others in instructions_that_also_let_it_start[idx]):
+            del instructions_to_start_before[idx]
+
 def start_instruction(state, idx, claims, circuit, circuit_wires, session_of, durations):
     duration = duration_of(circuit.data[idx].operation.name, durations)
     finish = state.clock + duration
@@ -238,7 +249,8 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
             state.clock = state.next_finish()
             finish_instructions_at_clock(state, succs, sessions_closing_from_instruction, sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time)
         elif state.ready:
-            raise RuntimeError("stalled")
+            if not release_lazy_holds(state, instructions_to_start_before_first_instruction):
+                raise RuntimeError("stalled")
 
     return state
 

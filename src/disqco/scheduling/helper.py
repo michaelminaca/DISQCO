@@ -5,6 +5,7 @@ from disqco.scheduling.commutation import split_instruction_indicies_to_commutin
 
 DATA_REG = re.compile(r"^Q(\d+)_q$")
 COMM_REG = re.compile(r"^C(\d+)_(\d+)$")
+RAW_PAIR_REG = re.compile(r"^C(\d+)_raw$")
 
 def wire_key(index, wire, session_of):
     return (wire, session_of.get((index, wire)))
@@ -91,3 +92,34 @@ def instructions_to_start_before_first_instruction_on_data(circuit, session_of, 
             continue
         instructions_to_start_before[instructions[0]] = [pred for pred in preds[first_instruction_using_a_session] if pred not in instructions]
     return instructions_to_start_before
+
+def instructions_per_data_qubit(circuit, session_of):
+    instructions_on_data_qubit = {}
+    for idx, instruction in enumerate(circuit.data):
+        for qubit in instruction.qubits:
+            if session_of.get((idx, qubit)) is None:
+                instructions_on_data_qubit.setdefault(qubit, []).append(idx)
+    return instructions_on_data_qubit
+
+def uses_a_session(circuit, session_of, idx):
+    return any((idx, wire) in session_of for wire in circuit.data[idx].qubits)
+
+def first_uses_of_a_session(circuit, session_of, preds, instructions_on_the_qubit):
+    on_the_qubit = set(instructions_on_the_qubit)
+    after_one_that_uses_a_session, first = set(), []
+    for idx in instructions_on_the_qubit:
+        earlier_on_the_qubit = [pred for pred in preds[idx] if pred in on_the_qubit]
+        if any(pred in after_one_that_uses_a_session or uses_a_session(circuit, session_of, pred) for pred in earlier_on_the_qubit):
+            after_one_that_uses_a_session.add(idx)
+        elif uses_a_session(circuit, session_of, idx):
+            first.append(idx)
+    return first
+
+def others_that_let_first_on_data_start(circuit, session_of, preds):
+    also_let_it_start = {}
+    for instructions in instructions_per_data_qubit(circuit, session_of).values():
+        first = first_uses_of_a_session(circuit, session_of, preds, instructions)
+        if len(first) > 1 and instructions[0] not in first:
+            also_let_it_start.setdefault(instructions[0], []).extend(
+                [pred for pred in preds[idx] if pred not in instructions] for idx in first)
+    return also_let_it_start

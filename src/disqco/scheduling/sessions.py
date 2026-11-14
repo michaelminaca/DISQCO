@@ -1,11 +1,11 @@
 from qiskit import QuantumCircuit
 from qiskit.circuit import Qubit
-from disqco.scheduling.helper import DATA_REG, COMM_REG
+from disqco.scheduling.helper import DATA_REG, COMM_REG, RAW_PAIR_REG
 
 def map_comm_qubits_to_qpus(circuit: QuantumCircuit):
     qpu_of = {}
     for register in circuit.qregs:
-        match = COMM_REG.match(register.name)
+        match = COMM_REG.match(register.name) or RAW_PAIR_REG.match(register.name)
         if match is None:
             continue
         for comm_qubit in register:

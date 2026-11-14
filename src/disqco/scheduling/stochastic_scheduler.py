@@ -4,12 +4,18 @@ import random
 from enum import IntEnum
 from disqco.scheduling.errors import ErrorModel, fidelity
 from disqco.scheduling.evaluator import duration_of, wires_of
-from disqco.scheduling.scheduler import (ScheduleState, claim_order_by_circuit, claim_order_by_priority, claims_to_start, first_instruction_may_start, host_chooser, prepare, start_instruction)
+from disqco.scheduling.scheduler import (ScheduleState, claim_order_by_circuit, claim_order_by_priority, claims_to_start, first_instruction_may_start, host_chooser, prepare, release_holds_if_pair_on_the_way, release_lazy_holds, start_instruction)
 from disqco.scheduling.sessions import first_instruction_using_the_pair, sessions_ending_at, sessions_opening_at
-from disqco.scheduling.buffer import BufferEvent, expected_wait_until_pair_is_used, move_tail_if_it_pays, spare_slots_by_qpu
+from disqco.scheduling.buffer import BufferEvent, expected_wait_until_pair_is_used, move_tail_if_it_pays, move_tails_on_comm_if_it_pays, spare_slots_by_qpu
 from disqco.scheduling.decay import use_by_time_of_pair
-from disqco.scheduling.helper import ancestor_eprs, instructions_to_start_before_first_instruction_on_data
+from disqco.scheduling.helper import ancestor_eprs, others_that_let_first_on_data_start, instructions_to_start_before_first_instruction_on_data
 from disqco.scheduling.validation import validate_schedule
+from disqco.scheduling.distillation import consumer_of_half, with_raw_pairs
+
+MAX_DISCARDS_PER_PAIR = 50
+"""A schedule that has discarded more pairs than this, per pair in the circuit, is not going to finish: a pair keeps
+timing out because the instruction that would use it can never start. Without this limit that loops forever, with
+the clock advancing, where the deterministic scheduler would have raised "stalled"."""
 
 class EPREvent(IntEnum):
     TIMED_OUT = -3
@@ -100,6 +106,8 @@ def epr_timed_out(state, epr, circuit, sessions, session_of, succs, sessions_ope
     undo_instruction(state, epr, succs)
     state.ready.add(epr)
     state.discards += 1
+    if state.discards > MAX_DISCARDS_PER_PAIR * len(sessions_opening_from_instruction):
+        raise RuntimeError("stalled")
 
 def time_to_check_the_pair_again(state, epr, sessions_opening_from_instruction, consumer_of_session, eprs_before_consumer, preds):
     """at a timeout if expected time to use the pair is less than the mean of generating a new pair then push a new timeout event to the heap to recheck it later. Otherwise return None."""
@@ -112,7 +120,7 @@ def time_to_check_the_pair_again(state, epr, sessions_opening_from_instruction, 
     return state.clock + max(expected_wait_until_used, state.attempt)
 
 
-def instruction_finished(state, idx, succs, sessions_closing_from_instruction, sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time, consumer_of_session, eprs_before_consumer, preds):
+def instruction_finished(state, idx, succs, sessions_closing_from_instruction, sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time, consumer_of_session, preds, duration_of_instruction, eprs):
     for successor in succs[idx]:
         state.indeg[successor] -= 1
         if state.indeg[successor] == 0:
@@ -123,10 +131,10 @@ def instruction_finished(state, idx, succs, sessions_closing_from_instruction, s
 
     for session_id in sessions_opening_from_instruction.get(idx, []):
         move_tail_if_it_pays(state, session_id, meta, spare, epr_of, swap_time, reset_time,
-                             consumer_of_session, eprs_before_consumer, preds)
+                             consumer_of_session, preds, duration_of_instruction, eprs)
 
 
-def finish_instructions_at_clock(state, circuit, sessions, session_of, succs, sessions_closing_from_instruction, sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time, consumer_of_session, eprs_before_consumer, preds):
+def finish_instructions_at_clock(state, circuit, sessions, session_of, succs, sessions_closing_from_instruction, sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time, consumer_of_session, eprs_before_consumer, preds, duration_of_instruction, eprs, instruction_held_for_of_session):
     while state.running and state.next_finish() == state.clock:
         time, idx_or_kind, *rest = heapq.heappop(state.running)
         if isinstance(idx_or_kind, BufferEvent):
@@ -151,9 +159,10 @@ def finish_instructions_at_clock(state, circuit, sessions, session_of, succs, se
             continue
         state.finished.add(idx_or_kind)
         instruction_finished(state, idx_or_kind, succs, sessions_closing_from_instruction, sessions_opening_from_instruction,
-                             meta, spare, epr_of, swap_time, reset_time, consumer_of_session, eprs_before_consumer, preds)
+                             meta, spare, epr_of, swap_time, reset_time, instruction_held_for_of_session, preds, duration_of_instruction, eprs)
         if idx_or_kind in sessions_opening_from_instruction:
             epr_generated(state, idx_or_kind, sessions_opening_from_instruction)
+    move_tails_on_comm_if_it_pays(state, meta, spare, epr_of, swap_time, reset_time, instruction_held_for_of_session, preds, duration_of_instruction, eprs)
 
 
 def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, pool, choose_host, spare=None,
@@ -163,18 +172,23 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
     sessions_closing_from_instruction = sessions_ending_at(sessions)
     epr_of = [instructions[0] for instructions in sessions]
     consumer_of_session = {session_id: first_instruction_using_the_pair(circuit, sessions, session_of, session_id) for session_id in range(len(sessions))}
+    instruction_held_for_of_session = {session_id: consumer_of_half(circuit, sessions, session_of, session_id) for session_id in range(len(sessions))}
     ancestors = ancestor_eprs(circuit, preds, sessions_opening_from_instruction)
     eprs_before_consumer = {consumer: ancestors[consumer] - {epr_of[session_id]} for session_id, consumer in consumer_of_session.items()}
     spare = spare or {}
     swap_time, reset_time = duration_of("swap", durations), duration_of("reset", durations)
+    duration_of_instruction = [duration_of(instruction.operation.name, durations) for instruction in circuit.data]
+    eprs = {idx for idx, instruction in enumerate(circuit.data) if instruction.operation.name == "EPR"}
     error_model = error_model or ErrorModel()
     instructions_to_start_before_first_instruction = instructions_to_start_before_first_instruction_on_data(circuit, session_of, preds) if lazy_first_instructions else {}
+    instructions_that_also_let_it_start = others_that_let_first_on_data_start(circuit, session_of, preds) if lazy_first_instructions else {}
     state = StochasticScheduleState(len(circuit.data), preds, mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff)
 
     while state.ready or state.running:
         started_anything = True
         while started_anything:
             started_anything = False
+            release_holds_if_pair_on_the_way(state, instructions_to_start_before_first_instruction, instructions_that_also_let_it_start)
             for idx in sorted(state.ready, key=lambda i: -priority[i]):
                 if not first_instruction_may_start(state, idx, instructions_to_start_before_first_instruction):
                     continue
@@ -188,19 +202,24 @@ def run(circuit, sessions, session_of, meta, preds, succs, priority, durations, 
 
         if state.running:
             state.clock = state.next_finish()
+            discards_before = state.discards
             finish_instructions_at_clock(state, circuit, sessions, session_of, succs, sessions_closing_from_instruction,
                                          sessions_opening_from_instruction, meta, spare, epr_of, swap_time, reset_time,
-                                         consumer_of_session, eprs_before_consumer, preds)
+                                         consumer_of_session, eprs_before_consumer, preds, duration_of_instruction, eprs,
+                                         instruction_held_for_of_session)
+            if state.discards > discards_before:
+                release_lazy_holds(state, instructions_to_start_before_first_instruction)
         elif state.ready:
-            raise RuntimeError("stalled")
+            if not release_lazy_holds(state, instructions_to_start_before_first_instruction):
+                raise RuntimeError("stalled")
 
     validate_schedule(state, preds, circuit, sessions, session_of, swap_time, reset_time)
     return state
 
 def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True,
-             claim_order="priority"):
+             claim_order="priority", pairs_per_operation=1):
     """returns (makespan, discards, state)"""
-    renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, True, commuting)
+    renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(with_raw_pairs(circuit, pairs_per_operation), durations, network, True, commuting)
     order = claim_order_by_circuit(sessions, meta) if claim_order == "circuit" else claim_order_by_priority(sessions, meta, priority)
     choose_host = host_chooser(order, meta)
     spare = spare_slots_by_qpu(renamed_circuit, network) if buffer else None
@@ -208,8 +227,8 @@ def simulate(circuit, durations, mean=100, p=1.0, cutoff=None, trial=0, network=
                 mean, p, cutoff, trial, error_model, max_timeouts_pair_kept_beyond_cutoff, lazy_first_instructions)
     return max(state.end), state.discards, state
 
-def simulate_many(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True, claim_order="priority"):
-    renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(circuit, durations, network, True, commuting)
+def simulate_many(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True, claim_order="priority", pairs_per_operation=1):
+    renamed_circuit, sessions, sessions_of, meta, preds, succs, pool, priority = prepare(with_raw_pairs(circuit, pairs_per_operation), durations, network, True, commuting)
     order = claim_order_by_circuit(sessions, meta) if claim_order == "circuit" else claim_order_by_priority(sessions, meta, priority)
     choose_host = host_chooser(order, meta)
     spare = spare_slots_by_qpu(renamed_circuit, network) if buffer else None
@@ -228,11 +247,11 @@ def simulate_many(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, 
         summary["rate"] = summary["fidelity"] / summary["mean"]
     return summary
 
-def simulate_many_best(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True):
+def simulate_many_best(circuit, durations, trials=100, mean=100, p=1.0, cutoff=None, network=None, commuting=True, buffer=False, error_model=None, max_timeouts_pair_kept_beyond_cutoff=0, lazy_first_instructions=True, pairs_per_operation=1):
     """simulate_many with the priority and the circuit claim order on the same trials, returns (claim order, summary) of the one with the lower mean makespan"""
     summary_of_claim_order = {}
     for claim_order in ("priority", "circuit"):
         summary_of_claim_order[claim_order] = simulate_many(circuit, durations, trials, mean, p, cutoff, network, commuting, buffer, error_model,
-                                                            max_timeouts_pair_kept_beyond_cutoff, lazy_first_instructions, claim_order)
+                                                            max_timeouts_pair_kept_beyond_cutoff, lazy_first_instructions, claim_order, pairs_per_operation)
     best_claim_order = min(summary_of_claim_order, key=lambda claim_order: summary_of_claim_order[claim_order]["mean"])
     return best_claim_order, summary_of_claim_order[best_claim_order]

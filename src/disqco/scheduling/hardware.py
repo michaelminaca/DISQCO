@@ -10,12 +10,23 @@ def comm_index(circuit: QuantumCircuit, qubit):
         return None
     return idx
 
+def declared_comm_qubits(qpu, candidates, network: QuantumNetwork, circuit: QuantumCircuit):
+    declared = []
+    for qubit in candidates:
+        idx = comm_index(circuit, qubit)
+        if idx is not None and idx < network.comm_sizes[qpu]:
+            declared.append(qubit)
+    return declared
+
 def hosts_for_session(session_id, meta, pool, network: QuantumNetwork, circuit: QuantumCircuit):
     """Communication qubit hosts the given session can be hosted on"""
     qpu = meta[session_id]["qpu"]
     candidates = pool[qpu]
-    if network is None or qpu not in network.comm_links:
+    if network is None:
         return list(candidates)
+    candidates = declared_comm_qubits(qpu, candidates, network, circuit)
+    if qpu not in network.comm_links:
+        return candidates
 
     partners = meta[session_id]["partners"]
     partner = next(iter(partners))
